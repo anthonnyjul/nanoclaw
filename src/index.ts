@@ -61,6 +61,8 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { startModelHealthObserver } from './model_health_observer.js';
+import { startSizingObserver } from './sizing_observer.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -701,6 +703,10 @@ async function main(): Promise<void> {
       }
     },
   });
+  // Observers: model health warm-up + weekly sizing calibration reports
+  startModelHealthObserver();
+  startSizingObserver();
+
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
