@@ -33,10 +33,29 @@ export class SlackChannel implements Channel {
 
   private app: App;
   private botUserId: string | undefined;
+  private ownBotId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+
+  // Active-thread map per channel — drives the Threading Rule (added 2026-05-02,
+  // see groups/slack_tce-develop/CLAUDE.md "Threading Rule"). When an inbound
+  // message is in a thread OR is a bracketed-title topic-opener, we remember
+  // the thread context for that channel; the next outbound sendMessage uses
+  // that thread_ts so Aria's reply lands in-thread instead of top-level.
+  // Lost on restart by design — fresh runs start with empty thread context.
+  private activeThread: Map<string, string> = new Map();
+
+  // Bracketed-title topic-opener detector: messages whose first non-whitespace
+  // characters are `[...]` are treated as topic openers. The agent's reply
+  // threads under them. Examples that match:
+  //   [TCE — request received: ...]
+  //   [Daily routine — ...]
+  //   [Pipeline / Bugfix: ...]
+  //   [Agent-manager — Threading rule rolled out]
+  // Conservative: requires a `[` then any chars then `]` early in the message.
+  private static readonly TOPIC_OPENER_RE = /^\s*(?::[a-z0-9_+-]+:\s*)?\*?\[[^\]]+\]/i;
 
   private opts: SlackChannelOpts;
 
@@ -79,9 +98,29 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
+      // Threading Rule (added 2026-05-02): we now propagate thread context.
+      // Three cases for inbound:
+      //   (a) msg.thread_ts present (already in a thread) → reply in same thread
+      //   (b) msg is a bracketed-title topic-opener → reply IN its thread
+      //       (use msg.ts as the thread_ts so we open the thread)
+      //   (c) plain top-level message → reply top-level (legacy behavior)
+      //
+      // We track this per-channel so sendMessage can pick the right thread_ts
+      // without changing the OnInboundMessage / Channel contract.
+      const inboundThreadTs = (msg as { thread_ts?: string }).thread_ts;
+      const isTopicOpener =
+        !inboundThreadTs &&
+        typeof msg.text === 'string' &&
+        SlackChannel.TOPIC_OPENER_RE.test(msg.text);
+      if (inboundThreadTs) {
+        this.activeThread.set(msg.channel, inboundThreadTs);
+      } else if (isTopicOpener) {
+        this.activeThread.set(msg.channel, msg.ts);
+      } else {
+        // Plain top-level — clear any stale active thread so unrelated
+        // chitchat doesn't accidentally land in an old thread.
+        this.activeThread.delete(msg.channel);
+      }
 
       const jid = `slack:${msg.channel}`;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
@@ -94,7 +133,13 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
+      // Only flag as "from us" when the message came from OUR bot integration.
+      // Slack stamps `bot_id` on every chat.postMessage response, including
+      // user-token posts from OTHER apps — so a truthy `bot_id` alone is not
+      // enough; we must compare it to our own bot_id captured at startup.
+      const isBotMessage =
+        msg.user === this.botUserId ||
+        (!!msg.bot_id && !!this.ownBotId && msg.bot_id === this.ownBotId);
 
       let senderName: string;
       if (isBotMessage) {
@@ -142,7 +187,11 @@ export class SlackChannel implements Channel {
     try {
       const auth = await this.app.client.auth.test();
       this.botUserId = auth.user_id as string;
-      logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
+      this.ownBotId = (auth as { bot_id?: string }).bot_id;
+      logger.info(
+        { botUserId: this.botUserId, ownBotId: this.ownBotId },
+        'Connected to Slack',
+      );
     } catch (err) {
       logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
@@ -169,13 +218,20 @@ export class SlackChannel implements Channel {
     }
 
     try {
+      // Threading Rule (2026-05-02): if there's an active thread context for
+      // this channel (set by inbound thread messages OR bracketed-title topic
+      // openers), reply in-thread. Otherwise post top-level (legacy behavior).
+      const threadTs = this.activeThread.get(channelId);
+      const baseArgs: { channel: string; thread_ts?: string } = { channel: channelId };
+      if (threadTs) baseArgs.thread_ts = threadTs;
+
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await this.app.client.chat.postMessage({ ...baseArgs, text });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
-            channel: channelId,
+            ...baseArgs,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
           });
         }
