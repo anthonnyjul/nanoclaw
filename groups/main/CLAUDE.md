@@ -592,6 +592,19 @@ state = deps["deployments"][0]["state"]  # READY / ERROR / BUILDING
 
 **Step 1 — Classify root cause**: `tool-bug` / `briefing-gap` / `file-size-limit` / `routing-error` / `infrastructure` / `timeout` / `other`
 
+**Step 1.5 — Edge Case + Blast Radius Analysis (mandatory before any code change)**
+Produce a `DirectFixProposal` before writing or proposing a fix:
+- **root_cause**: one sentence — the confirmed mechanism, not a symptom
+- **edge_cases**: minimum 3 (fields: `id`, `description`, `symptom`, `guard`, `landing_file`, `priority P0/P1/P2`)
+  - What adjacent failure modes exist beyond the one I'm fixing?
+  - What happens if the fix itself is partial, applied to stale state, or triggers a race?
+- **blast_radius**: files I'm changing + downstream ✓/✗ per `dependency_map.md`
+- **questions_for_claude_code**: explicit list (for TCE fixes — always consult before Step 2)
+
+Output must be schema-shaped (Pydantic instance fields, not freeform prose). For TCE fixes: post the filled proposal to claude_code in `#tce-develop` and wait for architectural feedback before proceeding to Step 2. For non-TCE fixes: write it inline, then proceed.
+
+Do not proceed to Step 2 until edge cases are written and blast radius is mapped.
+
 **Step 2 — Code fix assessment (the critical step)**
 Does this root cause require a change to agent-team source code? Check:
 - `github_tool.py` / other tools — does a tool need a guard, fallback, or size check?
