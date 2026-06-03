@@ -242,11 +242,14 @@ function buildContainerArgs(
   );
 
   // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
+  // API key mode:  SDK sends x-api-key, proxy replaces with real key.
+  // OAuth mode:    SDK exchanges placeholder token for temp API key, proxy
+  //                injects real OAuth token on that exchange request.
+  // OpenRouter:    SDK uses api-key style auth; proxy strips x-api-key and
+  //                injects an Authorization: Bearer header for OpenRouter
+  //                instead of forwarding to Anthropic.
   const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
+  if (authMode === 'api-key' || authMode === 'openrouter') {
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
