@@ -55,7 +55,8 @@ export class SlackChannel implements Channel {
   //   [Pipeline / Bugfix: ...]
   //   [Agent-manager — Threading rule rolled out]
   // Conservative: requires a `[` then any chars then `]` early in the message.
-  private static readonly TOPIC_OPENER_RE = /^\s*(?::[a-z0-9_+-]+:\s*)?\*?\[[^\]]+\]/i;
+  private static readonly TOPIC_OPENER_RE =
+    /^\s*(?::[a-z0-9_+-]+:\s*)?\*?\[[^\]]+\]/i;
 
   private opts: SlackChannelOpts;
 
@@ -137,9 +138,16 @@ export class SlackChannel implements Channel {
       // Slack stamps `bot_id` on every chat.postMessage response, including
       // user-token posts from OTHER apps — so a truthy `bot_id` alone is not
       // enough; we must compare it to our own bot_id captured at startup.
+      //
+      // If our botUserId is somehow still unresolved (auth.test failed,
+      // intermittent network at startup), fall back to dropping the message
+      // when it carries any `bot_id` — better to occasionally ignore an
+      // unrelated bot's post than to echo our own and trigger a loop.
+      const identityResolved = !!this.botUserId || !!this.ownBotId;
       const isBotMessage =
         msg.user === this.botUserId ||
-        (!!msg.bot_id && !!this.ownBotId && msg.bot_id === this.ownBotId);
+        (!!msg.bot_id && !!this.ownBotId && msg.bot_id === this.ownBotId) ||
+        (!identityResolved && !!msg.bot_id);
 
       let senderName: string;
       if (isBotMessage) {
@@ -179,22 +187,29 @@ export class SlackChannel implements Channel {
   }
 
   async connect(): Promise<void> {
-    await this.app.start();
-
-    // Get bot's own user ID for self-message detection.
-    // Resolve this BEFORE setting connected=true so that messages arriving
-    // during startup can correctly detect bot-sent messages.
+    // Resolve the bot's own user ID BEFORE starting the socket. Otherwise the
+    // message handler (registered in the constructor) can fire on inbound
+    // events between `app.start()` and `auth.test()` resolving, classifying
+    // our own posts as third-party messages and triggering an echo loop.
+    // auth.test is an HTTP call via the WebClient and does not require the
+    // socket to be connected.
     try {
       const auth = await this.app.client.auth.test();
       this.botUserId = auth.user_id as string;
       this.ownBotId = (auth as { bot_id?: string }).bot_id;
       logger.info(
         { botUserId: this.botUserId, ownBotId: this.ownBotId },
-        'Connected to Slack',
+        'Resolved bot identity before connecting',
       );
     } catch (err) {
-      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
+      logger.warn(
+        { err },
+        'Failed to resolve bot user ID before connect — self-detection may misclassify until next reconnect',
+      );
     }
+
+    await this.app.start();
+    logger.info('Connected to Slack');
 
     this.connected = true;
 
@@ -222,7 +237,9 @@ export class SlackChannel implements Channel {
       // this channel (set by inbound thread messages OR bracketed-title topic
       // openers), reply in-thread. Otherwise post top-level (legacy behavior).
       const threadTs = this.activeThread.get(channelId);
-      const baseArgs: { channel: string; thread_ts?: string } = { channel: channelId };
+      const baseArgs: { channel: string; thread_ts?: string } = {
+        channel: channelId,
+      };
       if (threadTs) baseArgs.thread_ts = threadTs;
 
       // Slack limits messages to ~4000 characters; split if needed

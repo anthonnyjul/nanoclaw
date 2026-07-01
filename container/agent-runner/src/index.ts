@@ -365,6 +365,7 @@ async function runQuery(
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
+  let lastAssistantText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -437,6 +438,18 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Track last text-bearing assistant message. Some OpenRouter providers
+      // (Gemini, DeepSeek) emit redacted_thinking blocks AFTER the final text
+      // block, which causes the SDK's result.result to fall back to null
+      // when its "last assistant message" lookup lands on a thinking-only
+      // block. Falling back to lastAssistantText keeps the channel post intact.
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+      if (Array.isArray(content)) {
+        const textParts = content.filter((c) => c && c.type === 'text' && typeof c.text === 'string' && c.text.length > 0);
+        if (textParts.length > 0) {
+          lastAssistantText = textParts.map((c) => c.text!).join('');
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -451,13 +464,15 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const sdkResult = 'result' in message ? (message as { result?: string }).result : null;
+      const textResult = sdkResult || lastAssistantText || null;
+      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${!sdkResult && lastAssistantText ? ' (fallback=lastAssistantText)' : ''}`);
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: textResult,
         newSessionId
       });
+      lastAssistantText = undefined;
     }
   }
 
