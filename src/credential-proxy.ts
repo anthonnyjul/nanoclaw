@@ -46,10 +46,13 @@ export interface ProxyConfig {
 const OPENROUTER_DEFAULT_MODEL = 'claude-haiku-4-5';
 const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
-function rewriteModelInBody(
+export function rewriteModelInBody(
   body: Buffer,
   contentType: string | undefined,
   newModel: string,
+  reasoningEffort?: string,
+  enableCompression?: boolean,
+  providerWhitelist?: string[],
 ): Buffer {
   if (body.length === 0) return body;
   const ct = (contentType || '').toLowerCase();
@@ -64,6 +67,50 @@ function rewriteModelInBody(
     return body;
   }
   parsed.model = newModel;
+  // OpenRouter-side reasoning control: when the override model supports it
+  // (Gemini Flash, DeepSeek V4 Pro), inject the universal `reasoning.effort`
+  // knob and strip the Anthropic-native `thinking` block so the two don't
+  // collide. Per OR docs: effort maps to thinkingLevel for Gemini 3.x and
+  // reasoning effort for DeepSeek V4 Pro (high/xhigh only).
+  if (reasoningEffort) {
+    // exclude: true keeps reasoning internal — provider still thinks, but no
+    // reasoning_content / redacted_thinking blocks appear in the response.
+    // Required for Gemini path: Gemini emits trailing thinking blocks that
+    // the Claude Code SDK treats as the final assistant message, leaving
+    // result.result=null and the channel post empty.
+    parsed.reasoning = { effort: reasoningEffort, exclude: true };
+    if (parsed.thinking) delete parsed.thinking;
+  }
+  // OpenRouter context-compression plugin (middle-out transform). OR enables
+  // this by default only for endpoints ≤8k context; large-context models
+  // (Haiku 4.5 200k, Gemini 3.5 Flash 1M, Sonnet 4.6 1M) do NOT auto-compress,
+  // so an oversize input — accumulated Slack history, runaway tool-call chain,
+  // Anthropic per-call message-count cap — surfaces as "Prompt is too long"
+  // and aborts the request. Enabling the plugin is a no-op for normal-sized
+  // prompts: middle-out only activates when the prompt exceeds the model's
+  // ctx, then drops messages from the middle (LLMs attend least there) until
+  // it fits. Per https://openrouter.ai/docs/guides/features/message-transforms.
+  if (enableCompression) {
+    const existing = Array.isArray(parsed.plugins) ? parsed.plugins : [];
+    const hasCompression = existing.some(
+      (p: any) => p && typeof p === 'object' && p.id === 'context-compression',
+    );
+    if (!hasCompression) {
+      parsed.plugins = [...existing, { id: 'context-compression' }];
+    }
+  }
+  // OpenRouter provider routing. Without this, OR picks a provider by
+  // price/latency, which for DeepSeek and Qwen defaults to Chinese-hosted
+  // endpoints (StreamLake, Novita, Baidu) that route user data through PRC
+  // jurisdiction. `provider.order` pins routing to the given list in order,
+  // and `allow_fallbacks: false` refuses to spill to unlisted providers.
+  // Empty/absent whitelist → OR default routing (no restriction).
+  if (providerWhitelist && providerWhitelist.length > 0) {
+    parsed.provider = {
+      order: providerWhitelist,
+      allow_fallbacks: false,
+    };
+  }
   return Buffer.from(JSON.stringify(parsed), 'utf-8') as Buffer;
 }
 
@@ -107,6 +154,9 @@ export function startCredentialProxy(
     'NANOCLAW_USE_OPENROUTER',
     'OPENROUTER_API_KEY',
     'OPENROUTER_MODEL_OVERRIDE',
+    'OPENROUTER_REASONING_EFFORT',
+    'OPENROUTER_ENABLE_COMPRESSION',
+    'OPENROUTER_PROVIDER_WHITELIST',
   ]);
 
   // Prefer the Pro token for nanoclaw containers (Aria lane). Fall back to
@@ -118,10 +168,23 @@ export function startCredentialProxy(
 
   // OpenRouter takes precedence when explicitly enabled AND an OR key exists.
   const openrouterEnabled =
-    secrets.NANOCLAW_USE_OPENROUTER === '1' &&
-    !!secrets.OPENROUTER_API_KEY;
+    secrets.NANOCLAW_USE_OPENROUTER === '1' && !!secrets.OPENROUTER_API_KEY;
   const openrouterModelOverride =
     secrets.OPENROUTER_MODEL_OVERRIDE || OPENROUTER_DEFAULT_MODEL;
+  const openrouterReasoningEffort = secrets.OPENROUTER_REASONING_EFFORT || '';
+  // Default ON when openrouter mode is active. Set OPENROUTER_ENABLE_COMPRESSION=0
+  // to disable and surface the raw "Prompt is too long" error instead.
+  const openrouterEnableCompression =
+    secrets.OPENROUTER_ENABLE_COMPRESSION === '0' ? false : openrouterEnabled;
+  // Comma-separated OR provider slugs (e.g. "Fireworks,Together,DeepInfra").
+  // Empty string / unset → OR picks provider automatically (may route to
+  // Chinese-hosted endpoints for DeepSeek/Qwen slugs).
+  const openrouterProviderWhitelist = (
+    secrets.OPENROUTER_PROVIDER_WHITELIST || ''
+  )
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
   // Default mode: OAuth when token present, else API key. API key takes over
   // per-request when the Pro lane is throttled (spillover, optional).
@@ -186,10 +249,7 @@ export function startCredentialProxy(
         // Forward path; in openrouter mode the upstream lives under /api so
         // a client path of /v1/messages routes to /api/v1/messages upstream.
         let forwardPath = req.url || '/';
-        if (
-          requestMode === 'openrouter' &&
-          forwardPath.startsWith('/v1/')
-        ) {
+        if (requestMode === 'openrouter' && forwardPath.startsWith('/v1/')) {
           forwardPath = '/api' + forwardPath;
         }
 
@@ -204,6 +264,11 @@ export function startCredentialProxy(
               body,
               headers['content-type'] as string | undefined,
               openrouterModelOverride,
+              openrouterReasoningEffort || undefined,
+              openrouterEnableCompression,
+              openrouterProviderWhitelist.length > 0
+                ? openrouterProviderWhitelist
+                : undefined,
             );
             headers['content-length'] = body.length;
           }
@@ -329,10 +394,7 @@ export function detectAuthMode(): AuthMode {
     'NANOCLAW_USE_OPENROUTER',
     'OPENROUTER_API_KEY',
   ]);
-  if (
-    secrets.NANOCLAW_USE_OPENROUTER === '1' &&
-    secrets.OPENROUTER_API_KEY
-  ) {
+  if (secrets.NANOCLAW_USE_OPENROUTER === '1' && secrets.OPENROUTER_API_KEY) {
     return 'openrouter';
   }
   return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
