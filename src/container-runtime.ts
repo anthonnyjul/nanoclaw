@@ -25,7 +25,8 @@ export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
  * Override with CONTAINER_HOST_GATEWAY env var if auto-detection fails.
  */
 export function getContainerHostGateway(): string {
-  if (process.env.CONTAINER_HOST_GATEWAY) return process.env.CONTAINER_HOST_GATEWAY;
+  if (process.env.CONTAINER_HOST_GATEWAY)
+    return process.env.CONTAINER_HOST_GATEWAY;
   if (CONTAINER_RUNTIME_BIN === 'container') {
     return detectAppleContainerBridgeIp() ?? 'host.docker.internal';
   }

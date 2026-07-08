@@ -17,7 +17,9 @@ import Database from 'better-sqlite3';
 import { logger } from './logger.js';
 import { TIMEZONE } from './config.js';
 
-const SESSIONS_DB = process.env.AGENT_TEAM_DB ?? `${process.env.HOME}/agent-team/memory/sessions.db`;
+const SESSIONS_DB =
+  process.env.AGENT_TEAM_DB ??
+  `${process.env.HOME}/agent-team/memory/sessions.db`;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? '';
 const MANAGER_CHANNEL = process.env.SLACK_MANAGER_CHANNEL ?? '#agent-manager';
 
@@ -32,7 +34,7 @@ async function postToSlack(channel: string, text: string): Promise<void> {
     await fetch('https://slack.com/api/chat.postMessage', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${SLACK_BOT_TOKEN}`,
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ channel, text }),
@@ -46,7 +48,13 @@ async function postToSlack(channel: string, text: string): Promise<void> {
 
 function isMonday815am(): boolean {
   const now = new Date();
-  const localStr = now.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+  const localStr = now.toLocaleString('en-US', {
+    timeZone: TIMEZONE,
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
   return localStr.includes('Mon') && localStr.includes('08:1');
 }
 
@@ -63,30 +71,43 @@ async function runSizingCalibrationReport(): Promise<void> {
     const db = new Database(SESSIONS_DB, { readonly: true });
 
     // ── Outcome distribution (last 7 days) ────────────────────────────────
-    const outcomes = db.prepare(`
+    const outcomes = db
+      .prepare(
+        `
       SELECT outcome, COUNT(*) as count
       FROM engineer_sessions
       WHERE created_at >= datetime('now', '-7 days')
       GROUP BY outcome ORDER BY count DESC
-    `).all() as { outcome: string; count: number }[];
+    `,
+      )
+      .all() as { outcome: string; count: number }[];
 
     if (outcomes.length > 0) {
       report += '*Engineer session outcomes (7 days):*\n```\n';
-      report += outcomes.map(r => `${(r.outcome ?? 'unknown').padEnd(20)} ${r.count}`).join('\n');
+      report += outcomes
+        .map((r) => `${(r.outcome ?? 'unknown').padEnd(20)} ${r.count}`)
+        .join('\n');
       report += '\n```\n\n';
     }
 
     // ── Recent escalations with failure context ────────────────────────────
-    const escalations = db.prepare(`
+    const escalations = db
+      .prepare(
+        `
       SELECT project, domain, task_summary, what_failed, created_at
       FROM engineer_sessions
       WHERE created_at >= datetime('now', '-7 days')
         AND (outcome LIKE '%escalat%' OR outcome LIKE '%bridge%' OR outcome LIKE '%fail%')
       ORDER BY created_at DESC
       LIMIT 5
-    `).all() as {
-      project: string; domain: string; task_summary: string;
-      what_failed: string; created_at: string;
+    `,
+      )
+      .all() as {
+      project: string;
+      domain: string;
+      task_summary: string;
+      what_failed: string;
+      created_at: string;
     }[];
 
     if (escalations.length > 0) {
@@ -100,30 +121,41 @@ async function runSizingCalibrationReport(): Promise<void> {
     }
 
     // ── Skill evolution ────────────────────────────────────────────────────
-    const skillsWritten = db.prepare(`
+    const skillsWritten = db
+      .prepare(
+        `
       SELECT COUNT(*) as count
       FROM engineer_sessions
       WHERE created_at >= datetime('now', '-7 days')
         AND skill_written != '' AND skill_written IS NOT NULL
-    `).get() as { count: number };
+    `,
+      )
+      .get() as { count: number };
 
     report += `*Skills auto-written this week:* ${skillsWritten?.count ?? 0}\n\n`;
 
     // ── Project breakdown ──────────────────────────────────────────────────
-    const byProject = db.prepare(`
+    const byProject = db
+      .prepare(
+        `
       SELECT project, COUNT(*) as sessions,
              SUM(CASE WHEN outcome NOT LIKE '%fail%' AND outcome NOT LIKE '%bridge%' THEN 1 ELSE 0 END) as successes
       FROM engineer_sessions
       WHERE created_at >= datetime('now', '-7 days')
       GROUP BY project ORDER BY sessions DESC
-    `).all() as { project: string; sessions: number; successes: number }[];
+    `,
+      )
+      .all() as { project: string; sessions: number; successes: number }[];
 
     if (byProject.length > 0) {
       report += '*By project:*\n```\n';
-      report += byProject.map(r => {
-        const rate = r.sessions > 0 ? Math.round((r.successes / r.sessions) * 100) : 0;
-        return `${(r.project ?? 'unknown').padEnd(20)} ${r.sessions} sessions, ${rate}% success`;
-      }).join('\n');
+      report += byProject
+        .map((r) => {
+          const rate =
+            r.sessions > 0 ? Math.round((r.successes / r.sessions) * 100) : 0;
+          return `${(r.project ?? 'unknown').padEnd(20)} ${r.sessions} sessions, ${rate}% success`;
+        })
+        .join('\n');
       report += '\n```\n';
     }
 
@@ -150,5 +182,8 @@ export function startSizingObserver(): void {
 }
 
 export function stopSizingObserver(): void {
-  if (weeklyTimer) { clearInterval(weeklyTimer); weeklyTimer = null; }
+  if (weeklyTimer) {
+    clearInterval(weeklyTimer);
+    weeklyTimer = null;
+  }
 }
