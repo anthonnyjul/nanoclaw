@@ -1,0 +1,652 @@
+diff --git a/container/agent-runner/src/index.ts b/container/agent-runner/src/index.ts
+index 25554f9..c7f99c7 100644
+--- a/container/agent-runner/src/index.ts
++++ b/container/agent-runner/src/index.ts
+@@ -365,6 +365,7 @@ async function runQuery(
+ 
+   let newSessionId: string | undefined;
+   let lastAssistantUuid: string | undefined;
++  let lastAssistantText: string | undefined;
+   let messageCount = 0;
+   let resultCount = 0;
+ 
+@@ -437,6 +438,18 @@ async function runQuery(
+ 
+     if (message.type === 'assistant' && 'uuid' in message) {
+       lastAssistantUuid = (message as { uuid: string }).uuid;
++      // Track last text-bearing assistant message. Some OpenRouter providers
++      // (Gemini, DeepSeek) emit redacted_thinking blocks AFTER the final text
++      // block, which causes the SDK's result.result to fall back to null
++      // when its "last assistant message" lookup lands on a thinking-only
++      // block. Falling back to lastAssistantText keeps the channel post intact.
++      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
++      if (Array.isArray(content)) {
++        const textParts = content.filter((c) => c && c.type === 'text' && typeof c.text === 'string' && c.text.length > 0);
++        if (textParts.length > 0) {
++          lastAssistantText = textParts.map((c) => c.text!).join('');
++        }
++      }
+     }
+ 
+     if (message.type === 'system' && message.subtype === 'init') {
+@@ -451,13 +464,15 @@ async function runQuery(
+ 
+     if (message.type === 'result') {
+       resultCount++;
+-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
+-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
++      const sdkResult = 'result' in message ? (message as { result?: string }).result : null;
++      const textResult = sdkResult || lastAssistantText || null;
++      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${!sdkResult && lastAssistantText ? ' (fallback=lastAssistantText)' : ''}`);
+       writeOutput({
+         status: 'success',
+-        result: textResult || null,
++        result: textResult,
+         newSessionId
+       });
++      lastAssistantText = undefined;
+     }
+   }
+ 
+diff --git a/src/channels/slack.ts b/src/channels/slack.ts
+index 51797ef..b8f9028 100644
+--- a/src/channels/slack.ts
++++ b/src/channels/slack.ts
+@@ -55,7 +55,8 @@ export class SlackChannel implements Channel {
+   //   [Pipeline / Bugfix: ...]
+   //   [Agent-manager — Threading rule rolled out]
+   // Conservative: requires a `[` then any chars then `]` early in the message.
+-  private static readonly TOPIC_OPENER_RE = /^\s*(?::[a-z0-9_+-]+:\s*)?\*?\[[^\]]+\]/i;
++  private static readonly TOPIC_OPENER_RE =
++    /^\s*(?::[a-z0-9_+-]+:\s*)?\*?\[[^\]]+\]/i;
+ 
+   private opts: SlackChannelOpts;
+ 
+@@ -137,9 +138,16 @@ export class SlackChannel implements Channel {
+       // Slack stamps `bot_id` on every chat.postMessage response, including
+       // user-token posts from OTHER apps — so a truthy `bot_id` alone is not
+       // enough; we must compare it to our own bot_id captured at startup.
++      //
++      // If our botUserId is somehow still unresolved (auth.test failed,
++      // intermittent network at startup), fall back to dropping the message
++      // when it carries any `bot_id` — better to occasionally ignore an
++      // unrelated bot's post than to echo our own and trigger a loop.
++      const identityResolved = !!this.botUserId || !!this.ownBotId;
+       const isBotMessage =
+         msg.user === this.botUserId ||
+-        (!!msg.bot_id && !!this.ownBotId && msg.bot_id === this.ownBotId);
++        (!!msg.bot_id && !!this.ownBotId && msg.bot_id === this.ownBotId) ||
++        (!identityResolved && !!msg.bot_id);
+ 
+       let senderName: string;
+       if (isBotMessage) {
+@@ -179,23 +187,30 @@ export class SlackChannel implements Channel {
+   }
+ 
+   async connect(): Promise<void> {
+-    await this.app.start();
+-
+-    // Get bot's own user ID for self-message detection.
+-    // Resolve this BEFORE setting connected=true so that messages arriving
+-    // during startup can correctly detect bot-sent messages.
++    // Resolve the bot's own user ID BEFORE starting the socket. Otherwise the
++    // message handler (registered in the constructor) can fire on inbound
++    // events between `app.start()` and `auth.test()` resolving, classifying
++    // our own posts as third-party messages and triggering an echo loop.
++    // auth.test is an HTTP call via the WebClient and does not require the
++    // socket to be connected.
+     try {
+       const auth = await this.app.client.auth.test();
+       this.botUserId = auth.user_id as string;
+       this.ownBotId = (auth as { bot_id?: string }).bot_id;
+       logger.info(
+         { botUserId: this.botUserId, ownBotId: this.ownBotId },
+-        'Connected to Slack',
++        'Resolved bot identity before connecting',
+       );
+     } catch (err) {
+-      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
++      logger.warn(
++        { err },
++        'Failed to resolve bot user ID before connect — self-detection may misclassify until next reconnect',
++      );
+     }
+ 
++    await this.app.start();
++    logger.info('Connected to Slack');
++
+     this.connected = true;
+ 
+     // Flush any messages queued before connection
+@@ -222,7 +237,9 @@ export class SlackChannel implements Channel {
+       // this channel (set by inbound thread messages OR bracketed-title topic
+       // openers), reply in-thread. Otherwise post top-level (legacy behavior).
+       const threadTs = this.activeThread.get(channelId);
+-      const baseArgs: { channel: string; thread_ts?: string } = { channel: channelId };
++      const baseArgs: { channel: string; thread_ts?: string } = {
++        channel: channelId,
++      };
+       if (threadTs) baseArgs.thread_ts = threadTs;
+ 
+       // Slack limits messages to ~4000 characters; split if needed
+diff --git a/src/container-runtime.ts b/src/container-runtime.ts
+index bbd4d1d..00fd92d 100644
+--- a/src/container-runtime.ts
++++ b/src/container-runtime.ts
+@@ -25,7 +25,8 @@ export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+  * Override with CONTAINER_HOST_GATEWAY env var if auto-detection fails.
+  */
+ export function getContainerHostGateway(): string {
+-  if (process.env.CONTAINER_HOST_GATEWAY) return process.env.CONTAINER_HOST_GATEWAY;
++  if (process.env.CONTAINER_HOST_GATEWAY)
++    return process.env.CONTAINER_HOST_GATEWAY;
+   if (CONTAINER_RUNTIME_BIN === 'container') {
+     return detectAppleContainerBridgeIp() ?? 'host.docker.internal';
+   }
+diff --git a/src/credential-proxy.test.ts b/src/credential-proxy.test.ts
+index de76c89..a72cbf5 100644
+--- a/src/credential-proxy.test.ts
++++ b/src/credential-proxy.test.ts
+@@ -168,6 +168,104 @@ describe('credential-proxy', () => {
+     expect(lastUpstreamHeaders['transfer-encoding']).toBeUndefined();
+   });
+ 
++  it('429 spillover: OAuth lane 429 retries with API key', async () => {
++    // Override the upstream server: first call (OAuth) returns 429,
++    // second call (API key retry) returns 200.
++    await new Promise<void>((r) => upstreamServer.close(() => r()));
++
++    let callCount = 0;
++    const calls: { auth?: string; xApiKey?: string }[] = [];
++    upstreamServer = http.createServer((req, res) => {
++      callCount += 1;
++      calls.push({
++        auth: req.headers['authorization'] as string | undefined,
++        xApiKey: req.headers['x-api-key'] as string | undefined,
++      });
++      if (callCount === 1) {
++        res.writeHead(429, { 'content-type': 'application/json' });
++        res.end(
++          JSON.stringify({
++            type: 'error',
++            error: { type: 'rate_limit_error', message: 'Error' },
++          }),
++        );
++      } else {
++        res.writeHead(200, { 'content-type': 'application/json' });
++        res.end(JSON.stringify({ ok: true, viaRetry: true }));
++      }
++    });
++    await new Promise<void>((resolve) =>
++      upstreamServer.listen(0, '127.0.0.1', resolve),
++    );
++    upstreamPort = (upstreamServer.address() as AddressInfo).port;
++
++    proxyPort = await startProxy({
++      CLAUDE_CODE_RESPONDER_OAUTH_TOKEN: 'pro-oauth-token',
++      ANTHROPIC_API_KEY: 'sk-ant-spillover-key',
++    });
++
++    const res = await makeRequest(
++      proxyPort,
++      {
++        method: 'POST',
++        path: '/v1/messages',
++        headers: {
++          'content-type': 'application/json',
++          authorization: 'Bearer placeholder',
++        },
++      },
++      '{}',
++    );
++
++    expect(callCount).toBe(2);
++    expect(calls[0].auth).toBe('Bearer pro-oauth-token');
++    expect(calls[0].xApiKey).toBeUndefined();
++    expect(calls[1].xApiKey).toBe('sk-ant-spillover-key');
++    expect(calls[1].auth).toBeUndefined();
++    expect(res.statusCode).toBe(200);
++    expect(JSON.parse(res.body)).toMatchObject({ ok: true, viaRetry: true });
++  });
++
++  it('429 spillover skipped when no ANTHROPIC_API_KEY configured', async () => {
++    await new Promise<void>((r) => upstreamServer.close(() => r()));
++
++    let callCount = 0;
++    upstreamServer = http.createServer((req, res) => {
++      callCount += 1;
++      res.writeHead(429, { 'content-type': 'application/json' });
++      res.end(
++        JSON.stringify({
++          type: 'error',
++          error: { type: 'rate_limit_error', message: 'Error' },
++        }),
++      );
++    });
++    await new Promise<void>((resolve) =>
++      upstreamServer.listen(0, '127.0.0.1', resolve),
++    );
++    upstreamPort = (upstreamServer.address() as AddressInfo).port;
++
++    proxyPort = await startProxy({
++      CLAUDE_CODE_RESPONDER_OAUTH_TOKEN: 'pro-oauth-token',
++    });
++
++    const res = await makeRequest(
++      proxyPort,
++      {
++        method: 'POST',
++        path: '/v1/messages',
++        headers: {
++          'content-type': 'application/json',
++          authorization: 'Bearer placeholder',
++        },
++      },
++      '{}',
++    );
++
++    expect(callCount).toBe(1);
++    expect(res.statusCode).toBe(429);
++  });
++
+   it('returns 502 when upstream is unreachable', async () => {
+     Object.assign(mockEnv, {
+       ANTHROPIC_API_KEY: 'sk-ant-real-key',
+diff --git a/src/credential-proxy.ts b/src/credential-proxy.ts
+index 03c46c9..5baa31c 100644
+--- a/src/credential-proxy.ts
++++ b/src/credential-proxy.ts
+@@ -50,6 +50,8 @@ function rewriteModelInBody(
+   body: Buffer,
+   contentType: string | undefined,
+   newModel: string,
++  reasoningEffort?: string,
++  enableCompression?: boolean,
+ ): Buffer {
+   if (body.length === 0) return body;
+   const ct = (contentType || '').toLowerCase();
+@@ -64,6 +66,38 @@ function rewriteModelInBody(
+     return body;
+   }
+   parsed.model = newModel;
++  // OpenRouter-side reasoning control: when the override model supports it
++  // (Gemini Flash, DeepSeek V4 Pro), inject the universal `reasoning.effort`
++  // knob and strip the Anthropic-native `thinking` block so the two don't
++  // collide. Per OR docs: effort maps to thinkingLevel for Gemini 3.x and
++  // reasoning effort for DeepSeek V4 Pro (high/xhigh only).
++  if (reasoningEffort) {
++    // exclude: true keeps reasoning internal — provider still thinks, but no
++    // reasoning_content / redacted_thinking blocks appear in the response.
++    // Required for Gemini path: Gemini emits trailing thinking blocks that
++    // the Claude Code SDK treats as the final assistant message, leaving
++    // result.result=null and the channel post empty.
++    parsed.reasoning = { effort: reasoningEffort, exclude: true };
++    if (parsed.thinking) delete parsed.thinking;
++  }
++  // OpenRouter context-compression plugin (middle-out transform). OR enables
++  // this by default only for endpoints ≤8k context; large-context models
++  // (Haiku 4.5 200k, Gemini 3.5 Flash 1M, Sonnet 4.6 1M) do NOT auto-compress,
++  // so an oversize input — accumulated Slack history, runaway tool-call chain,
++  // Anthropic per-call message-count cap — surfaces as "Prompt is too long"
++  // and aborts the request. Enabling the plugin is a no-op for normal-sized
++  // prompts: middle-out only activates when the prompt exceeds the model's
++  // ctx, then drops messages from the middle (LLMs attend least there) until
++  // it fits. Per https://openrouter.ai/docs/guides/features/message-transforms.
++  if (enableCompression) {
++    const existing = Array.isArray(parsed.plugins) ? parsed.plugins : [];
++    const hasCompression = existing.some(
++      (p: any) => p && typeof p === 'object' && p.id === 'context-compression',
++    );
++    if (!hasCompression) {
++      parsed.plugins = [...existing, { id: 'context-compression' }];
++    }
++  }
+   return Buffer.from(JSON.stringify(parsed), 'utf-8') as Buffer;
+ }
+ 
+@@ -107,6 +141,8 @@ export function startCredentialProxy(
+     'NANOCLAW_USE_OPENROUTER',
+     'OPENROUTER_API_KEY',
+     'OPENROUTER_MODEL_OVERRIDE',
++    'OPENROUTER_REASONING_EFFORT',
++    'OPENROUTER_ENABLE_COMPRESSION',
+   ]);
+ 
+   // Prefer the Pro token for nanoclaw containers (Aria lane). Fall back to
+@@ -118,10 +154,14 @@ export function startCredentialProxy(
+ 
+   // OpenRouter takes precedence when explicitly enabled AND an OR key exists.
+   const openrouterEnabled =
+-    secrets.NANOCLAW_USE_OPENROUTER === '1' &&
+-    !!secrets.OPENROUTER_API_KEY;
++    secrets.NANOCLAW_USE_OPENROUTER === '1' && !!secrets.OPENROUTER_API_KEY;
+   const openrouterModelOverride =
+     secrets.OPENROUTER_MODEL_OVERRIDE || OPENROUTER_DEFAULT_MODEL;
++  const openrouterReasoningEffort = secrets.OPENROUTER_REASONING_EFFORT || '';
++  // Default ON when openrouter mode is active. Set OPENROUTER_ENABLE_COMPRESSION=0
++  // to disable and surface the raw "Prompt is too long" error instead.
++  const openrouterEnableCompression =
++    secrets.OPENROUTER_ENABLE_COMPRESSION === '0' ? false : openrouterEnabled;
+ 
+   // Default mode: OAuth when token present, else API key. API key takes over
+   // per-request when the Pro lane is throttled (spillover, optional).
+@@ -186,10 +226,7 @@ export function startCredentialProxy(
+         // Forward path; in openrouter mode the upstream lives under /api so
+         // a client path of /v1/messages routes to /api/v1/messages upstream.
+         let forwardPath = req.url || '/';
+-        if (
+-          requestMode === 'openrouter' &&
+-          forwardPath.startsWith('/v1/')
+-        ) {
++        if (requestMode === 'openrouter' && forwardPath.startsWith('/v1/')) {
+           forwardPath = '/api' + forwardPath;
+         }
+ 
+@@ -204,6 +241,8 @@ export function startCredentialProxy(
+               body,
+               headers['content-type'] as string | undefined,
+               openrouterModelOverride,
++              openrouterReasoningEffort || undefined,
++              openrouterEnableCompression,
+             );
+             headers['content-length'] = body.length;
+           }
+@@ -329,10 +368,7 @@ export function detectAuthMode(): AuthMode {
+     'NANOCLAW_USE_OPENROUTER',
+     'OPENROUTER_API_KEY',
+   ]);
+-  if (
+-    secrets.NANOCLAW_USE_OPENROUTER === '1' &&
+-    secrets.OPENROUTER_API_KEY
+-  ) {
++  if (secrets.NANOCLAW_USE_OPENROUTER === '1' && secrets.OPENROUTER_API_KEY) {
+     return 'openrouter';
+   }
+   return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+diff --git a/src/model_health_observer.ts b/src/model_health_observer.ts
+index 4353664..c6c0e27 100644
+--- a/src/model_health_observer.ts
++++ b/src/model_health_observer.ts
+@@ -19,11 +19,13 @@ import { TIMEZONE } from './config.js';
+ 
+ const LITELLM_BASE = process.env.LITELLM_API_BASE ?? 'http://localhost:4000';
+ const OLLAMA_BASE = 'http://localhost:11434';
+-const SESSIONS_DB = process.env.AGENT_TEAM_DB ?? `${process.env.HOME}/agent-team/memory/sessions.db`;
++const SESSIONS_DB =
++  process.env.AGENT_TEAM_DB ??
++  `${process.env.HOME}/agent-team/memory/sessions.db`;
+ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? '';
+ const MANAGER_CHANNEL = process.env.SLACK_MANAGER_CHANNEL ?? '#agent-manager';
+ 
+-const WARMUP_INTERVAL_MS = 8 * 60 * 1000;  // 8 minutes
++const WARMUP_INTERVAL_MS = 8 * 60 * 1000; // 8 minutes
+ const WEEKLY_CHECK_INTERVAL_MS = 60 * 60 * 1000; // check every hour; run report on Monday 08:00
+ 
+ let consecutiveFailures = 0;
+@@ -38,7 +40,7 @@ async function postToSlack(channel: string, text: string): Promise<void> {
+     await fetch('https://slack.com/api/chat.postMessage', {
+       method: 'POST',
+       headers: {
+-        'Authorization': `Bearer ${SLACK_BOT_TOKEN}`,
++        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+         'Content-Type': 'application/json',
+       },
+       body: JSON.stringify({ channel, text }),
+@@ -71,14 +73,17 @@ async function pingOllama(): Promise<void> {
+     }
+   } catch (err) {
+     consecutiveFailures++;
+-    logger.warn({ err, consecutiveFailures }, '[model-health] Ollama warm-up ping failed');
++    logger.warn(
++      { err, consecutiveFailures },
++      '[model-health] Ollama warm-up ping failed',
++    );
+ 
+     if (consecutiveFailures >= 3) {
+       await postToSlack(
+         MANAGER_CHANNEL,
+         `:warning: *Model health alert* — Ollama warm-up ping failed ${consecutiveFailures} times in a row.\n` +
+-        `qwen3:30b-a3b may be unresponsive. Engineer tasks will fall back to Sonnet until resolved.\n` +
+-        `Check: \`docker exec homelab-ollama ollama list\``,
++          `qwen3:30b-a3b may be unresponsive. Engineer tasks will fall back to Sonnet until resolved.\n` +
++          `Check: \`docker exec homelab-ollama ollama list\``,
+       );
+     }
+   }
+@@ -89,7 +94,12 @@ async function pingOllama(): Promise<void> {
+ function isMonday8am(): boolean {
+   const now = new Date();
+   // Use TIMEZONE to determine local time
+-  const localStr = now.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', hour: '2-digit', hour12: false });
++  const localStr = now.toLocaleString('en-US', {
++    timeZone: TIMEZONE,
++    weekday: 'short',
++    hour: '2-digit',
++    hour12: false,
++  });
+   return localStr.startsWith('Mon') && localStr.includes('08');
+ }
+ 
+@@ -114,7 +124,9 @@ async function runWeeklyHealthReport(): Promise<void> {
+   try {
+     const db = new Database(SESSIONS_DB, { readonly: true });
+ 
+-    const rows = db.prepare(`
++    const rows = db
++      .prepare(
++        `
+       SELECT
+         outcome,
+         COUNT(*) as count
+@@ -122,13 +134,16 @@ async function runWeeklyHealthReport(): Promise<void> {
+       WHERE created_at >= datetime('now', '-7 days')
+       GROUP BY outcome
+       ORDER BY count DESC
+-    `).all() as { outcome: string; count: number }[];
++    `,
++      )
++      .all() as { outcome: string; count: number }[];
+ 
+-    const bridgeFailures = rows.find(r => r.outcome?.toLowerCase().includes('bridge'))?.count ?? 0;
++    const bridgeFailures =
++      rows.find((r) => r.outcome?.toLowerCase().includes('bridge'))?.count ?? 0;
+     const total = rows.reduce((s, r) => s + r.count, 0);
+     const failRate = total > 0 ? Math.round((bridgeFailures / total) * 100) : 0;
+ 
+-    const breakdown = rows.map(r => `  ${r.outcome}: ${r.count}`).join('\n');
++    const breakdown = rows.map((r) => `  ${r.outcome}: ${r.count}`).join('\n');
+     sessionSummary = `Total: ${total} | Bridge-failures: ${bridgeFailures} (${failRate}%)\n${breakdown}`;
+ 
+     const alertThreshold = 15;
+@@ -136,8 +151,8 @@ async function runWeeklyHealthReport(): Promise<void> {
+       await postToSlack(
+         MANAGER_CHANNEL,
+         `:rotating_light: *Model health alert* — Bridge-failure rate ${failRate}% exceeds ${alertThreshold}% threshold.\n` +
+-        `This likely indicates qwen3:30b-a3b is timing out and falling back to Sonnet.\n` +
+-        `Consider increasing \`timeout\` in litellm config or reducing \`num_ctx\`.`,
++          `This likely indicates qwen3:30b-a3b is timing out and falling back to Sonnet.\n` +
++          `Consider increasing \`timeout\` in litellm config or reducing \`num_ctx\`.`,
+       );
+     }
+ 
+@@ -161,7 +176,7 @@ async function runWeeklyHealthReport(): Promise<void> {
+ 
+ export function startModelHealthObserver(): void {
+   // Warm-up: every 8 minutes
+-  pingOllama().catch(() => {});  // immediate first ping
++  pingOllama().catch(() => {}); // immediate first ping
+   warmupTimer = setInterval(() => {
+     pingOllama().catch(() => {});
+   }, WARMUP_INTERVAL_MS);
+@@ -173,10 +188,18 @@ export function startModelHealthObserver(): void {
+     });
+   }, WEEKLY_CHECK_INTERVAL_MS);
+ 
+-  logger.info('[model-health] Observer started (warm-up every 8min, report every Monday 08:00)');
++  logger.info(
++    '[model-health] Observer started (warm-up every 8min, report every Monday 08:00)',
++  );
+ }
+ 
+ export function stopModelHealthObserver(): void {
+-  if (warmupTimer) { clearInterval(warmupTimer); warmupTimer = null; }
+-  if (weeklyTimer) { clearInterval(weeklyTimer); weeklyTimer = null; }
++  if (warmupTimer) {
++    clearInterval(warmupTimer);
++    warmupTimer = null;
++  }
++  if (weeklyTimer) {
++    clearInterval(weeklyTimer);
++    weeklyTimer = null;
++  }
+ }
+diff --git a/src/sizing_observer.ts b/src/sizing_observer.ts
+index b77ed4e..a492fb6 100644
+--- a/src/sizing_observer.ts
++++ b/src/sizing_observer.ts
+@@ -17,7 +17,9 @@ import Database from 'better-sqlite3';
+ import { logger } from './logger.js';
+ import { TIMEZONE } from './config.js';
+ 
+-const SESSIONS_DB = process.env.AGENT_TEAM_DB ?? `${process.env.HOME}/agent-team/memory/sessions.db`;
++const SESSIONS_DB =
++  process.env.AGENT_TEAM_DB ??
++  `${process.env.HOME}/agent-team/memory/sessions.db`;
+ const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? '';
+ const MANAGER_CHANNEL = process.env.SLACK_MANAGER_CHANNEL ?? '#agent-manager';
+ 
+@@ -32,7 +34,7 @@ async function postToSlack(channel: string, text: string): Promise<void> {
+     await fetch('https://slack.com/api/chat.postMessage', {
+       method: 'POST',
+       headers: {
+-        'Authorization': `Bearer ${SLACK_BOT_TOKEN}`,
++        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+         'Content-Type': 'application/json',
+       },
+       body: JSON.stringify({ channel, text }),
+@@ -46,7 +48,13 @@ async function postToSlack(channel: string, text: string): Promise<void> {
+ 
+ function isMonday815am(): boolean {
+   const now = new Date();
+-  const localStr = now.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
++  const localStr = now.toLocaleString('en-US', {
++    timeZone: TIMEZONE,
++    weekday: 'short',
++    hour: '2-digit',
++    minute: '2-digit',
++    hour12: false,
++  });
+   return localStr.includes('Mon') && localStr.includes('08:1');
+ }
+ 
+@@ -63,30 +71,43 @@ async function runSizingCalibrationReport(): Promise<void> {
+     const db = new Database(SESSIONS_DB, { readonly: true });
+ 
+     // ── Outcome distribution (last 7 days) ────────────────────────────────
+-    const outcomes = db.prepare(`
++    const outcomes = db
++      .prepare(
++        `
+       SELECT outcome, COUNT(*) as count
+       FROM engineer_sessions
+       WHERE created_at >= datetime('now', '-7 days')
+       GROUP BY outcome ORDER BY count DESC
+-    `).all() as { outcome: string; count: number }[];
++    `,
++      )
++      .all() as { outcome: string; count: number }[];
+ 
+     if (outcomes.length > 0) {
+       report += '*Engineer session outcomes (7 days):*\n```\n';
+-      report += outcomes.map(r => `${(r.outcome ?? 'unknown').padEnd(20)} ${r.count}`).join('\n');
++      report += outcomes
++        .map((r) => `${(r.outcome ?? 'unknown').padEnd(20)} ${r.count}`)
++        .join('\n');
+       report += '\n```\n\n';
+     }
+ 
+     // ── Recent escalations with failure context ────────────────────────────
+-    const escalations = db.prepare(`
++    const escalations = db
++      .prepare(
++        `
+       SELECT project, domain, task_summary, what_failed, created_at
+       FROM engineer_sessions
+       WHERE created_at >= datetime('now', '-7 days')
+         AND (outcome LIKE '%escalat%' OR outcome LIKE '%bridge%' OR outcome LIKE '%fail%')
+       ORDER BY created_at DESC
+       LIMIT 5
+-    `).all() as {
+-      project: string; domain: string; task_summary: string;
+-      what_failed: string; created_at: string;
++    `,
++      )
++      .all() as {
++      project: string;
++      domain: string;
++      task_summary: string;
++      what_failed: string;
++      created_at: string;
+     }[];
+ 
+     if (escalations.length > 0) {
+@@ -100,30 +121,41 @@ async function runSizingCalibrationReport(): Promise<void> {
+     }
+ 
+     // ── Skill evolution ────────────────────────────────────────────────────
+-    const skillsWritten = db.prepare(`
++    const skillsWritten = db
++      .prepare(
++        `
+       SELECT COUNT(*) as count
+       FROM engineer_sessions
+       WHERE created_at >= datetime('now', '-7 days')
+         AND skill_written != '' AND skill_written IS NOT NULL
+-    `).get() as { count: number };
++    `,
++      )
++      .get() as { count: number };
+ 
+     report += `*Skills auto-written this week:* ${skillsWritten?.count ?? 0}\n\n`;
+ 
+     // ── Project breakdown ──────────────────────────────────────────────────
+-    const byProject = db.prepare(`
++    const byProject = db
++      .prepare(
++        `
+       SELECT project, COUNT(*) as sessions,
+              SUM(CASE WHEN outcome NOT LIKE '%fail%' AND outcome NOT LIKE '%bridge%' THEN 1 ELSE 0 END) as successes
+       FROM engineer_sessions
+       WHERE created_at >= datetime('now', '-7 days')
+       GROUP BY project ORDER BY sessions DESC
+-    `).all() as { project: string; sessions: number; successes: number }[];
++    `,
++      )
++      .all() as { project: string; sessions: number; successes: number }[];
+ 
+     if (byProject.length > 0) {
+       report += '*By project:*\n```\n';
+-      report += byProject.map(r => {
+-        const rate = r.sessions > 0 ? Math.round((r.successes / r.sessions) * 100) : 0;
+-        return `${(r.project ?? 'unknown').padEnd(20)} ${r.sessions} sessions, ${rate}% success`;
+-      }).join('\n');
++      report += byProject
++        .map((r) => {
++          const rate =
++            r.sessions > 0 ? Math.round((r.successes / r.sessions) * 100) : 0;
++          return `${(r.project ?? 'unknown').padEnd(20)} ${r.sessions} sessions, ${rate}% success`;
++        })
++        .join('\n');
+       report += '\n```\n';
+     }
+ 
+@@ -150,5 +182,8 @@ export function startSizingObserver(): void {
+ }
+ 
+ export function stopSizingObserver(): void {
+-  if (weeklyTimer) { clearInterval(weeklyTimer); weeklyTimer = null; }
++  if (weeklyTimer) {
++    clearInterval(weeklyTimer);
++    weeklyTimer = null;
++  }
+ }

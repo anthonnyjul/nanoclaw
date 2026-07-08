@@ -1,0 +1,12 @@
+ M container/agent-runner/src/index.ts
+ M src/channels/slack.ts
+ M src/container-runtime.ts
+ M src/credential-proxy.test.ts
+ M src/credential-proxy.ts
+ M src/model_health_observer.ts
+ M src/sizing_observer.ts
+?? .env.bak-20260531-183016
+?? archive/
+?? docs/architecture-snapshots/pre-phase-1-2026-07-01/
+?? nanoclaw.db
+?? state.db
