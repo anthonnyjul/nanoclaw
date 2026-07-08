@@ -19,11 +19,13 @@ import { TIMEZONE } from './config.js';
 
 const LITELLM_BASE = process.env.LITELLM_API_BASE ?? 'http://localhost:4000';
 const OLLAMA_BASE = 'http://localhost:11434';
-const SESSIONS_DB = process.env.AGENT_TEAM_DB ?? `${process.env.HOME}/agent-team/memory/sessions.db`;
+const SESSIONS_DB =
+  process.env.AGENT_TEAM_DB ??
+  `${process.env.HOME}/agent-team/memory/sessions.db`;
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? '';
 const MANAGER_CHANNEL = process.env.SLACK_MANAGER_CHANNEL ?? '#agent-manager';
 
-const WARMUP_INTERVAL_MS = 8 * 60 * 1000;  // 8 minutes
+const WARMUP_INTERVAL_MS = 8 * 60 * 1000; // 8 minutes
 const WEEKLY_CHECK_INTERVAL_MS = 60 * 60 * 1000; // check every hour; run report on Monday 08:00
 
 let consecutiveFailures = 0;
@@ -38,7 +40,7 @@ async function postToSlack(channel: string, text: string): Promise<void> {
     await fetch('https://slack.com/api/chat.postMessage', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${SLACK_BOT_TOKEN}`,
+        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ channel, text }),
@@ -71,14 +73,17 @@ async function pingOllama(): Promise<void> {
     }
   } catch (err) {
     consecutiveFailures++;
-    logger.warn({ err, consecutiveFailures }, '[model-health] Ollama warm-up ping failed');
+    logger.warn(
+      { err, consecutiveFailures },
+      '[model-health] Ollama warm-up ping failed',
+    );
 
     if (consecutiveFailures >= 3) {
       await postToSlack(
         MANAGER_CHANNEL,
         `:warning: *Model health alert* — Ollama warm-up ping failed ${consecutiveFailures} times in a row.\n` +
-        `qwen3:30b-a3b may be unresponsive. Engineer tasks will fall back to Sonnet until resolved.\n` +
-        `Check: \`docker exec homelab-ollama ollama list\``,
+          `qwen3:30b-a3b may be unresponsive. Engineer tasks will fall back to Sonnet until resolved.\n` +
+          `Check: \`docker exec homelab-ollama ollama list\``,
       );
     }
   }
@@ -89,7 +94,12 @@ async function pingOllama(): Promise<void> {
 function isMonday8am(): boolean {
   const now = new Date();
   // Use TIMEZONE to determine local time
-  const localStr = now.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', hour: '2-digit', hour12: false });
+  const localStr = now.toLocaleString('en-US', {
+    timeZone: TIMEZONE,
+    weekday: 'short',
+    hour: '2-digit',
+    hour12: false,
+  });
   return localStr.startsWith('Mon') && localStr.includes('08');
 }
 
@@ -114,7 +124,9 @@ async function runWeeklyHealthReport(): Promise<void> {
   try {
     const db = new Database(SESSIONS_DB, { readonly: true });
 
-    const rows = db.prepare(`
+    const rows = db
+      .prepare(
+        `
       SELECT
         outcome,
         COUNT(*) as count
@@ -122,13 +134,16 @@ async function runWeeklyHealthReport(): Promise<void> {
       WHERE created_at >= datetime('now', '-7 days')
       GROUP BY outcome
       ORDER BY count DESC
-    `).all() as { outcome: string; count: number }[];
+    `,
+      )
+      .all() as { outcome: string; count: number }[];
 
-    const bridgeFailures = rows.find(r => r.outcome?.toLowerCase().includes('bridge'))?.count ?? 0;
+    const bridgeFailures =
+      rows.find((r) => r.outcome?.toLowerCase().includes('bridge'))?.count ?? 0;
     const total = rows.reduce((s, r) => s + r.count, 0);
     const failRate = total > 0 ? Math.round((bridgeFailures / total) * 100) : 0;
 
-    const breakdown = rows.map(r => `  ${r.outcome}: ${r.count}`).join('\n');
+    const breakdown = rows.map((r) => `  ${r.outcome}: ${r.count}`).join('\n');
     sessionSummary = `Total: ${total} | Bridge-failures: ${bridgeFailures} (${failRate}%)\n${breakdown}`;
 
     const alertThreshold = 15;
@@ -136,8 +151,8 @@ async function runWeeklyHealthReport(): Promise<void> {
       await postToSlack(
         MANAGER_CHANNEL,
         `:rotating_light: *Model health alert* — Bridge-failure rate ${failRate}% exceeds ${alertThreshold}% threshold.\n` +
-        `This likely indicates qwen3:30b-a3b is timing out and falling back to Sonnet.\n` +
-        `Consider increasing \`timeout\` in litellm config or reducing \`num_ctx\`.`,
+          `This likely indicates qwen3:30b-a3b is timing out and falling back to Sonnet.\n` +
+          `Consider increasing \`timeout\` in litellm config or reducing \`num_ctx\`.`,
       );
     }
 
@@ -161,7 +176,7 @@ async function runWeeklyHealthReport(): Promise<void> {
 
 export function startModelHealthObserver(): void {
   // Warm-up: every 8 minutes
-  pingOllama().catch(() => {});  // immediate first ping
+  pingOllama().catch(() => {}); // immediate first ping
   warmupTimer = setInterval(() => {
     pingOllama().catch(() => {});
   }, WARMUP_INTERVAL_MS);
@@ -173,10 +188,18 @@ export function startModelHealthObserver(): void {
     });
   }, WEEKLY_CHECK_INTERVAL_MS);
 
-  logger.info('[model-health] Observer started (warm-up every 8min, report every Monday 08:00)');
+  logger.info(
+    '[model-health] Observer started (warm-up every 8min, report every Monday 08:00)',
+  );
 }
 
 export function stopModelHealthObserver(): void {
-  if (warmupTimer) { clearInterval(warmupTimer); warmupTimer = null; }
-  if (weeklyTimer) { clearInterval(weeklyTimer); weeklyTimer = null; }
+  if (warmupTimer) {
+    clearInterval(warmupTimer);
+    warmupTimer = null;
+  }
+  if (weeklyTimer) {
+    clearInterval(weeklyTimer);
+    weeklyTimer = null;
+  }
 }
