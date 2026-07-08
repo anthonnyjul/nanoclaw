@@ -1,0 +1,8 @@
+ container/agent-runner/src/index.ts | 21 ++++++--
+ src/channels/slack.ts               | 37 ++++++++++----
+ src/container-runtime.ts            |  3 +-
+ src/credential-proxy.test.ts        | 98 +++++++++++++++++++++++++++++++++++++
+ src/credential-proxy.ts             | 56 +++++++++++++++++----
+ src/model_health_observer.ts        | 57 ++++++++++++++-------
+ src/sizing_observer.ts              | 73 ++++++++++++++++++++-------
+ 7 files changed, 285 insertions(+), 60 deletions(-)
