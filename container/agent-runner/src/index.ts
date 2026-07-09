@@ -20,6 +20,28 @@ import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+import {
+  DEFAULT_THREAD_WINDOW,
+  THREAD_WINDOW_ENV_VAR,
+  findResumeAnchor,
+} from './thread-window.js';
+
+// Read the SDK session-log window once at process start. Set THREAD_WINDOW=0
+// to disable the anchor (SDK picks 'latest' on its own). See thread-window.ts
+// for the trailing-N-turns semantics and feedback-aria-session-bloat for why.
+const THREAD_WINDOW: number = (() => {
+  const raw = process.env[THREAD_WINDOW_ENV_VAR];
+  const parsed = raw ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) ? parsed : DEFAULT_THREAD_WINDOW;
+})();
+
+// Session JSONL path inside the container mount (per SDK layout at
+// projects/-workspace-group/<sessionId>.jsonl). Exposed as a helper so the
+// runQuery loop can derive the path from the current sessionId.
+function sessionJsonlPath(sessionId: string): string {
+  return `/home/node/.claude/projects/-workspace-group/${sessionId}.jsonl`;
+}
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -339,6 +361,20 @@ async function runQuery(
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  // Thread-window: when resuming an existing session and the caller has no
+  // scalar anchor yet, look up the N-th-last assistant UUID from the JSONL
+  // and use it as resumeSessionAt. Caps the SDK's log replay to the last N
+  // turns; prevents session-bloat 'Prompt is too long' failures.
+  if (sessionId && !resumeAt && THREAD_WINDOW > 0) {
+    const anchor = findResumeAnchor(sessionJsonlPath(sessionId), THREAD_WINDOW);
+    if (anchor) {
+      log(`Thread-window anchor: uuid=${anchor} (windowSize=${THREAD_WINDOW})`);
+      resumeAt = anchor;
+    } else {
+      log(`Thread-window: no anchor (log shorter than windowSize=${THREAD_WINDOW} or missing) — SDK picks 'latest'`);
+    }
+  }
+
   const stream = new MessageStream();
   stream.push(prompt);
 
