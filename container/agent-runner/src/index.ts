@@ -24,6 +24,8 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+import { extractAssistantText } from './result-text.js';
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -409,6 +411,7 @@ async function runQuery(
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
+  let lastAssistantText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -501,6 +504,14 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Track last text-bearing assistant message (see result-text.ts for
+      // why: trailing thinking blocks null out the SDK's result.result).
+      const text = extractAssistantText(
+        (message as { message?: { content?: unknown } }).message?.content,
+      );
+      if (text !== undefined) {
+        lastAssistantText = text;
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -524,16 +535,18 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult =
+      const sdkResult =
         'result' in message ? (message as { result?: string }).result : null;
+      const textResult = sdkResult || lastAssistantText || null;
       log(
-        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${!sdkResult && lastAssistantText ? ' (fallback=lastAssistantText)' : ''}`,
       );
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: textResult,
         newSessionId,
       });
+      lastAssistantText = undefined;
     }
   }
 

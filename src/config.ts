@@ -72,7 +72,11 @@ function escapeRegex(str: string): string {
 }
 
 export function buildTriggerPattern(trigger: string): RegExp {
-  return new RegExp(`^${escapeRegex(trigger.trim())}\\b`, 'i');
+  // The leading @ is optional so the bare assistant name also triggers
+  // ("Aria are you there?" as well as "@Aria ..."). Still start-anchored:
+  // mentioning the assistant mid-sentence is conversation, not a summons.
+  const name = trigger.trim().replace(/^@/, '');
+  return new RegExp(`^@?${escapeRegex(name)}\\b`, 'i');
 }
 
 export const DEFAULT_TRIGGER = `@${ASSISTANT_NAME}`;

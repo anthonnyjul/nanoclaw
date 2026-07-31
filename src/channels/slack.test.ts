@@ -6,9 +6,15 @@ vi.mock('../logger.js', () => ({
 
 vi.mock('../db.js', () => ({ updateChatName: vi.fn() }));
 
-const readEnvFile = vi.fn<(keys: string[]) => Record<string, string>>();
+// vi.hoisted + default implementation ({}) matter: slack.ts imports
+// config.js, which calls readEnvFile at module-load time — before the test
+// module's own body (and any mockReturnValue) has run.
+const { readEnvFile } = vi.hoisted(() => ({
+  readEnvFile: vi.fn<(keys: string[]) => Record<string, string>>(() => ({})),
+}));
 vi.mock('../env.js', () => ({ readEnvFile: (k: string[]) => readEnvFile(k) }));
 
+import { DEFAULT_TRIGGER } from '../config.js';
 import { updateChatName } from '../db.js';
 import { NewMessage, RegisteredGroup } from '../types.js';
 import { getChannelFactory } from './registry.js';
@@ -193,6 +199,78 @@ describe('polling', () => {
     expect(Number(history[1].params.get('oldest'))).toBeLessThan(
       Number(history[0].params.get('oldest')),
     );
+    await channel.disconnect();
+  });
+
+  it('rewrites a real bot mention to the group trigger form', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.0005',
+              text: `<@${BOT}> are you there?`,
+              user: 'U1',
+            },
+          ],
+        },
+        { ok: true, messages: [] },
+      ],
+      'users.info': [{ ok: true, user: { real_name: 'Ant' } }],
+    });
+
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe('@Aria are you there?');
+    await channel.disconnect();
+  });
+
+  it('rewrites a mention with the default trigger when the group trigger is empty', async () => {
+    const { channel, received } = await connected({
+      [JID]: { ...registered[JID], trigger: '' },
+    });
+    mockSlack({
+      'conversations.history': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.0007', text: `<@${BOT}> status?`, user: 'U1' },
+          ],
+        },
+        { ok: true, messages: [] },
+      ],
+      'users.info': [{ ok: true, user: { real_name: 'Ant' } }],
+    });
+
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe(`${DEFAULT_TRIGGER} status?`);
+    await channel.disconnect();
+  });
+
+  it('leaves other users mentions untouched', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.0006', text: '<@USOMEONE> ping', user: 'U1' },
+          ],
+        },
+        { ok: true, messages: [] },
+      ],
+      'users.info': [{ ok: true, user: { real_name: 'Ant' } }],
+    });
+
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe('<@USOMEONE> ping');
     await channel.disconnect();
   });
 
