@@ -10,5 +10,6 @@ import './slack.js';
 
 // telegram
 
-// whatsapp
-import './whatsapp.js';
+// whatsapp — disabled 2026-07-31: unused channel, was stuck in a reconnect
+// loop (440k retries / 99MB log). Re-enable by restoring the import.
+// import './whatsapp.js';
