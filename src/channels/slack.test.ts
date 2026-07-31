@@ -196,6 +196,54 @@ describe('polling', () => {
     await channel.disconnect();
   });
 
+  it('rewrites a real bot mention to the group trigger form', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.0005',
+              text: `<@${BOT}> are you there?`,
+              user: 'U1',
+            },
+          ],
+        },
+        { ok: true, messages: [] },
+      ],
+      'users.info': [{ ok: true, user: { real_name: 'Ant' } }],
+    });
+
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe('@Aria are you there?');
+    await channel.disconnect();
+  });
+
+  it('leaves other users mentions untouched', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.0006', text: '<@USOMEONE> ping', user: 'U1' },
+          ],
+        },
+        { ok: true, messages: [] },
+      ],
+      'users.info': [{ ok: true, user: { real_name: 'Ant' } }],
+    });
+
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe('<@USOMEONE> ping');
+    await channel.disconnect();
+  });
+
   it('ignores messages for chats that are not registered groups', async () => {
     const { channel, received, metadata } = await connected({});
     mockSlack({

@@ -256,13 +256,27 @@ export class SlackChannel implements Channel {
       (Boolean(this.botId) && msg.bot_id === this.botId);
     if (isFromMe) return;
 
+    // A real Slack mention arrives as `<@U…>`, which never matches the
+    // `@Name` trigger pattern. Rewrite our own mention to the group's
+    // trigger form so mentioning the bot summons it like typing its name.
+    const trigger = groups[chatJid].trigger?.trim();
+    const mentionAs = trigger
+      ? trigger.startsWith('@')
+        ? trigger
+        : `@${trigger}`
+      : '';
+    const content =
+      this.botUserId && mentionAs
+        ? (msg.text || '').replaceAll(`<@${this.botUserId}>`, mentionAs)
+        : msg.text || '';
+
     this.replyThreads.set(chatJid, msg.thread_ts);
     this.opts.onMessage(chatJid, {
       id: msg.ts,
       chat_jid: chatJid,
       sender,
       sender_name: this.senderNames.get(sender) || msg.username || sender,
-      content: msg.text || '',
+      content,
       timestamp,
       is_from_me: false,
       is_bot_message: Boolean(msg.bot_id),
