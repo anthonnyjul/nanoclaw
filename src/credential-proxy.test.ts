@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'fs';
 import http from 'http';
+import os from 'os';
+import path from 'path';
 import type { AddressInfo } from 'net';
 
 const mockEnv: Record<string, string> = {};
@@ -233,7 +236,7 @@ describe('credential-proxy', () => {
     await new Promise<void>((r) => upstreamServer.close(() => r()));
 
     let callCount = 0;
-    upstreamServer = http.createServer((req, res) => {
+    upstreamServer = http.createServer((_req, res) => {
       callCount += 1;
       res.writeHead(429, { 'content-type': 'application/json' });
       res.end(
@@ -307,7 +310,7 @@ describe('credential-proxy', () => {
         ),
         JSON_CT,
         'gemini-3-flash',
-        'high',
+        { reasoningEffort: 'high' },
       );
       const parsed = decode(out);
       expect(parsed.reasoning).toEqual({ effort: 'high', exclude: true });
@@ -319,7 +322,7 @@ describe('credential-proxy', () => {
         Buffer.from(JSON.stringify({ model: 'x' })),
         JSON_CT,
         'claude-haiku-4-5',
-        undefined,
+        {},
       );
       expect(decode(out).reasoning).toBeUndefined();
     });
@@ -329,8 +332,7 @@ describe('credential-proxy', () => {
         Buffer.from(JSON.stringify({ model: 'x' })),
         JSON_CT,
         'claude-haiku-4-5',
-        undefined,
-        true,
+        { enableCompression: true },
       );
       expect(decode(out).plugins).toEqual([{ id: 'context-compression' }]);
     });
@@ -345,8 +347,7 @@ describe('credential-proxy', () => {
         ),
         JSON_CT,
         'claude-haiku-4-5',
-        undefined,
-        true,
+        { enableCompression: true },
       );
       const plugins = decode(out).plugins;
       expect(plugins).toHaveLength(2);
@@ -360,9 +361,7 @@ describe('credential-proxy', () => {
         Buffer.from(JSON.stringify({ model: 'deepseek/deepseek-v4-pro' })),
         JSON_CT,
         'deepseek/deepseek-v4-pro',
-        undefined,
-        undefined,
-        ['Fireworks', 'Together', 'DeepInfra'],
+        { providerWhitelist: ['Fireworks', 'Together', 'DeepInfra'] },
       );
       const parsed = decode(out);
       expect(parsed.provider).toEqual({
@@ -383,12 +382,109 @@ describe('credential-proxy', () => {
         Buffer.from(JSON.stringify({ model: 'x' })),
         JSON_CT,
         'y',
-        undefined,
-        undefined,
-        [],
+        { providerWhitelist: [] },
       );
       expect(decode(empty).provider).toBeUndefined();
     });
+  });
+
+  it('openrouter mode: strips Anthropic auth, injects Bearer, prefixes /api, rewrites model', async () => {
+    await new Promise<void>((r) => upstreamServer.close(() => r()));
+
+    let seenUrl: string | undefined;
+    let seenHeaders: http.IncomingHttpHeaders = {};
+    let seenBody = '';
+    upstreamServer = http.createServer((req, res) => {
+      seenUrl = req.url;
+      seenHeaders = { ...req.headers };
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        seenBody = Buffer.concat(chunks).toString();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) =>
+      upstreamServer.listen(0, '127.0.0.1', resolve),
+    );
+    upstreamPort = (upstreamServer.address() as AddressInfo).port;
+
+    proxyPort = await startProxy({
+      NANOCLAW_USE_OPENROUTER: '1',
+      OPENROUTER_API_KEY: 'or-test-key',
+      OPENROUTER_BASE_URL: `http://127.0.0.1:${upstreamPort}/api/v1`,
+      OPENROUTER_MODEL_OVERRIDE: 'deepseek/deepseek-v4-pro',
+      OPENROUTER_PROVIDER_WHITELIST: 'Fireworks,Together',
+      // Present but must be ignored in openrouter mode:
+      ANTHROPIC_API_KEY: 'sk-ant-should-not-be-used',
+    });
+
+    const res = await makeRequest(
+      proxyPort,
+      {
+        method: 'POST',
+        path: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': 'placeholder',
+        },
+      },
+      JSON.stringify({ model: 'claude-opus-4-6' }),
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(seenUrl).toBe('/api/v1/messages');
+    expect(seenHeaders['authorization']).toBe('Bearer or-test-key');
+    expect(seenHeaders['x-api-key']).toBeUndefined();
+    const forwarded = JSON.parse(seenBody);
+    expect(forwarded.model).toBe('deepseek/deepseek-v4-pro');
+    expect(forwarded.provider).toEqual({
+      order: ['Fireworks', 'Together'],
+      allow_fallbacks: false,
+    });
+    expect(forwarded.plugins).toEqual([{ id: 'context-compression' }]);
+    expect(Number(seenHeaders['content-length'])).toBe(
+      Buffer.byteLength(seenBody),
+    );
+  });
+
+  it('rate-state spillover: throttled Pro lane routes the request to the API key', async () => {
+    const rateStatePath = path.join(
+      os.tmpdir(),
+      `nanoclaw-rate-state-${process.pid}-${Date.now()}.json`,
+    );
+    fs.writeFileSync(
+      rateStatePath,
+      JSON.stringify({ lanes: { pro: { status: 'throttled' } } }),
+    );
+
+    try {
+      proxyPort = await startProxy({
+        CLAUDE_CODE_RESPONDER_OAUTH_TOKEN: 'pro-oauth-token',
+        ANTHROPIC_API_KEY: 'sk-ant-spill-key',
+        NANOCLAW_RATE_STATE_PATH: rateStatePath,
+      });
+
+      const res = await makeRequest(
+        proxyPort,
+        {
+          method: 'POST',
+          path: '/v1/messages',
+          headers: {
+            'content-type': 'application/json',
+            authorization: 'Bearer placeholder',
+          },
+        },
+        '{}',
+      );
+
+      expect(res.statusCode).toBe(200);
+      expect(lastUpstreamHeaders['x-api-key']).toBe('sk-ant-spill-key');
+      expect(lastUpstreamHeaders['authorization']).toBeUndefined();
+    } finally {
+      fs.unlinkSync(rateStatePath);
+    }
   });
 
   it('returns 502 when upstream is unreachable', async () => {

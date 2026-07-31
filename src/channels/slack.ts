@@ -9,6 +9,7 @@
  * The token is read from .env only — never from process.env — so it is not
  * inherited by the agent containers this process spawns.
  */
+import { DEFAULT_TRIGGER } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -259,16 +260,13 @@ export class SlackChannel implements Channel {
     // A real Slack mention arrives as `<@U…>`, which never matches the
     // `@Name` trigger pattern. Rewrite our own mention to the group's
     // trigger form so mentioning the bot summons it like typing its name.
-    const trigger = groups[chatJid].trigger?.trim();
-    const mentionAs = trigger
-      ? trigger.startsWith('@')
-        ? trigger
-        : `@${trigger}`
-      : '';
-    const content =
-      this.botUserId && mentionAs
-        ? (msg.text || '').replaceAll(`<@${this.botUserId}>`, mentionAs)
-        : msg.text || '';
+    // Empty/missing trigger falls back to DEFAULT_TRIGGER, mirroring
+    // getTriggerPattern's fallback in the router.
+    const trigger = groups[chatJid].trigger?.trim() || DEFAULT_TRIGGER;
+    const mentionAs = trigger.startsWith('@') ? trigger : `@${trigger}`;
+    const content = this.botUserId
+      ? (msg.text || '').replaceAll(`<@${this.botUserId}>`, mentionAs)
+      : msg.text || '';
 
     this.replyThreads.set(chatJid, msg.thread_ts);
     this.opts.onMessage(chatJid, {

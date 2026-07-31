@@ -24,13 +24,12 @@ export interface ProxyConfig {
   authMode: AuthMode;
 }
 
-// OpenRouter mode (2026-06-03 multi-model swap, Phase 3):
+// OpenRouter mode:
 //
 // When NANOCLAW_USE_OPENROUTER=1 and OPENROUTER_API_KEY is set, the proxy
 // forwards container traffic to OpenRouter's Anthropic-compat endpoint
-// (/v1/messages) instead of api.anthropic.com. This moves Aria entirely
-// off Pro/Max OAuth quota — confirmed in the swap plan at
-// /Users/aria/.claude/plans/memoized-dreaming-duckling.md.
+// (/v1/messages) instead of api.anthropic.com, moving the assistant
+// entirely off Pro/Max OAuth quota.
 //
 // • Headers: strip x-api-key + Authorization, inject `Authorization: Bearer
 //   <OPENROUTER_API_KEY>`. OpenRouter accepts both header styles; Bearer is
@@ -44,16 +43,21 @@ export interface ProxyConfig {
 //   no Anthropic quota to fall back from. The probe + rate state remain
 //   untouched (still used by agent-team Engineer + sub-agents on Max).
 const OPENROUTER_DEFAULT_MODEL = 'claude-haiku-4-5';
-const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
+const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+
+export interface ModelRewriteOptions {
+  reasoningEffort?: string;
+  enableCompression?: boolean;
+  providerWhitelist?: string[];
+}
 
 export function rewriteModelInBody(
   body: Buffer,
   contentType: string | undefined,
   newModel: string,
-  reasoningEffort?: string,
-  enableCompression?: boolean,
-  providerWhitelist?: string[],
+  options: ModelRewriteOptions = {},
 ): Buffer {
+  const { reasoningEffort, enableCompression, providerWhitelist } = options;
   if (body.length === 0) return body;
   const ct = (contentType || '').toLowerCase();
   if (!ct.includes('application/json')) return body;
@@ -120,7 +124,8 @@ export function rewriteModelInBody(
 // CC responder uses, kept consistent here). The Max token stays as a fallback
 // for single-account installs. When ANTHROPIC_API_KEY is also configured and
 // the agent-team rate-state file reports the Pro lane throttled, the proxy
-// spills this request to the API key — mirrors src/spawn/rate_guard.py.
+// spills this request to the API key (same behavior as the agent-team's
+// own rate guard).
 const RATE_STATE_CACHE_MS = 30_000;
 let _rateStateCachedAt = 0;
 let _rateStateCached: any = null;
@@ -153,6 +158,7 @@ export function startCredentialProxy(
     'NANOCLAW_RATE_STATE_PATH',
     'NANOCLAW_USE_OPENROUTER',
     'OPENROUTER_API_KEY',
+    'OPENROUTER_BASE_URL',
     'OPENROUTER_MODEL_OVERRIDE',
     'OPENROUTER_REASONING_EFFORT',
     'OPENROUTER_ENABLE_COMPRESSION',
@@ -197,11 +203,15 @@ export function startCredentialProxy(
   const rateStatePath = secrets.NANOCLAW_RATE_STATE_PATH;
 
   // Anthropic upstream is host-only (paths from req.url forward as-is).
-  // OpenRouter mode forwards to https://openrouter.ai (host-only) and the
-  // request handler prefixes /api before /v1 path segments.
+  // OpenRouter mode forwards to https://openrouter.ai (host-only; override
+  // with OPENROUTER_BASE_URL, e.g. for tests) and the request handler
+  // prefixes /api before /v1 path segments.
   const upstreamUrl = new URL(
     openrouterEnabled
-      ? OPENROUTER_BASE_URL.replace(/\/api\/v1\/?$/, '')
+      ? (secrets.OPENROUTER_BASE_URL || OPENROUTER_DEFAULT_BASE_URL).replace(
+          /\/api\/v1\/?$/,
+          '',
+        )
       : secrets.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
   );
   const isHttps = upstreamUrl.protocol === 'https:';
@@ -264,11 +274,14 @@ export function startCredentialProxy(
               body,
               headers['content-type'] as string | undefined,
               openrouterModelOverride,
-              openrouterReasoningEffort || undefined,
-              openrouterEnableCompression,
-              openrouterProviderWhitelist.length > 0
-                ? openrouterProviderWhitelist
-                : undefined,
+              {
+                reasoningEffort: openrouterReasoningEffort || undefined,
+                enableCompression: openrouterEnableCompression,
+                providerWhitelist:
+                  openrouterProviderWhitelist.length > 0
+                    ? openrouterProviderWhitelist
+                    : undefined,
+              },
             );
             headers['content-length'] = body.length;
           }
@@ -354,6 +367,15 @@ export function startCredentialProxy(
           (upRes) => {
             if (upRes.statusCode === 429 && canRetryWithApiKey) {
               // Drain the 429 body so the socket can be reused, then retry.
+              // The drained response needs its own error handler: the retry
+              // already owns the client response, so a drain failure is
+              // log-only.
+              upRes.on('error', (err) => {
+                logger.warn(
+                  { err, url: req.url },
+                  'cred-proxy: error draining 429 response',
+                );
+              });
               upRes.resume();
               retryWithApiKey();
               return;

@@ -24,6 +24,8 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+import { extractAssistantText } from './result-text.js';
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -502,27 +504,13 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Track last text-bearing assistant message. Some OpenRouter providers
-      // (Gemini, DeepSeek) emit redacted_thinking blocks AFTER the final text
-      // block, which causes the SDK's result.result to fall back to null
-      // when its "last assistant message" lookup lands on a thinking-only
-      // block. Falling back to lastAssistantText keeps the channel post intact.
-      const content = (
-        message as {
-          message?: { content?: Array<{ type: string; text?: string }> };
-        }
-      ).message?.content;
-      if (Array.isArray(content)) {
-        const textParts = content.filter(
-          (c) =>
-            c &&
-            c.type === 'text' &&
-            typeof c.text === 'string' &&
-            c.text.length > 0,
-        );
-        if (textParts.length > 0) {
-          lastAssistantText = textParts.map((c) => c.text!).join('');
-        }
+      // Track last text-bearing assistant message (see result-text.ts for
+      // why: trailing thinking blocks null out the SDK's result.result).
+      const text = extractAssistantText(
+        (message as { message?: { content?: unknown } }).message?.content,
+      );
+      if (text !== undefined) {
+        lastAssistantText = text;
       }
     }
 

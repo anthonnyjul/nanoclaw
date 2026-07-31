@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 
-import { buildTriggerPattern, getTriggerPattern } from './config.js';
+import {
+  buildTriggerPattern,
+  getTriggerPattern,
+  DEFAULT_TRIGGER,
+} from './config.js';
 
 describe('buildTriggerPattern', () => {
   it('matches the @-prefixed trigger at the start', () => {
@@ -37,5 +41,12 @@ describe('buildTriggerPattern', () => {
 describe('getTriggerPattern', () => {
   it('uses the group trigger when given', () => {
     expect(getTriggerPattern('@Aria').test('aria ping')).toBe(true);
+  });
+
+  it('falls back to DEFAULT_TRIGGER when the trigger is missing or empty', () => {
+    const name = DEFAULT_TRIGGER.replace(/^@/, '');
+    expect(getTriggerPattern(undefined).test(`${name} hi`)).toBe(true);
+    expect(getTriggerPattern('').test(`@${name} hi`)).toBe(true);
+    expect(getTriggerPattern('  ').test(`${name} hi`)).toBe(true);
   });
 });
