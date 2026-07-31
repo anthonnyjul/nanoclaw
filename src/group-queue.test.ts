@@ -482,3 +482,35 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 });
+
+describe('isConversationActive', () => {
+  it('is false before any container and true only for live conversation containers', async () => {
+    const queue = new GroupQueue();
+    expect(queue.isConversationActive('g@slack')).toBe(false);
+
+    let release: () => void = () => {};
+    const running = new Promise<void>((r) => {
+      release = r;
+    });
+    queue.setProcessMessagesFn(async () => {
+      await running;
+      return true;
+    });
+    queue.enqueueMessageCheck('g@slack');
+    await new Promise((r) => setTimeout(r, 10));
+    // Active but no groupFolder registered yet — cannot pipe, not a live conversation
+    expect(queue.isConversationActive('g@slack')).toBe(false);
+
+    queue.registerProcess(
+      'g@slack',
+      { kill: () => true } as never,
+      'container-1',
+      'folder',
+    );
+    expect(queue.isConversationActive('g@slack')).toBe(true);
+
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(queue.isConversationActive('g@slack')).toBe(false);
+  });
+});

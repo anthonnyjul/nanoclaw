@@ -154,6 +154,18 @@ export class GroupQueue {
   }
 
   /**
+   * A conversation container is live for this group — the same condition
+   * under which sendMessage() can pipe a follow-up. While true, the group
+   * is mid-conversation and new messages should not need a fresh trigger.
+   */
+  isConversationActive(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return Boolean(
+      state?.active && state.groupFolder && !state.isTaskContainer,
+    );
+  }
+
+  /**
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */

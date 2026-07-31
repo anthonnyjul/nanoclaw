@@ -461,7 +461,14 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          // A live conversation container means the group was already
+          // summoned — follow-ups flow without re-triggering, like a
+          // human conversation. The window closes when the container
+          // goes idle and shuts down.
+          const needsTrigger =
+            !isMainGroup &&
+            group.requiresTrigger !== false &&
+            !queue.isConversationActive(chatJid);
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
