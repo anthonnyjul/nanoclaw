@@ -9,7 +9,7 @@
  * The token is read from .env only — never from process.env — so it is not
  * inherited by the agent containers this process spawns.
  */
-import { DEFAULT_TRIGGER } from '../config.js';
+import { buildTriggerPattern, DEFAULT_TRIGGER } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -46,6 +46,8 @@ interface SlackMessage {
   subtype?: string;
   thread_ts?: string;
   latest_reply?: string;
+  /** Set locally on thread replies: the parent message they answer. */
+  parent?: SlackMessage;
 }
 
 interface SlackApiResponse {
@@ -77,6 +79,14 @@ export class SlackChannel implements Channel {
   private cursors = new Map<string, string>();
   /** Thread to reply into, keyed by JID — set from the last inbound message. */
   private replyThreads = new Map<string, string | undefined>();
+  /**
+   * Threads the assistant has posted in, per JID. A reply into one of these
+   * is addressed at the assistant even without the trigger word — replying
+   * in someone's thread is how humans address them on Slack. In-memory only:
+   * after a restart the first reply in an old thread needs the trigger once.
+   */
+  private participatedThreads = new Map<string, Set<string>>();
+  private static readonly MAX_TRACKED_THREADS = 500;
   /** Display names by Slack user ID. Caches misses too, so we ask once. */
   private senderNames = new Map<string, string>();
   private botUserId = '';
@@ -135,6 +145,20 @@ export class SlackChannel implements Channel {
     });
     if (!res.ok) {
       throw new Error(`Slack chat.postMessage failed: ${res.error}`);
+    }
+    if (thread) this.rememberThread(jid, thread);
+  }
+
+  private rememberThread(jid: string, threadTs: string): void {
+    let set = this.participatedThreads.get(jid);
+    if (!set) {
+      set = new Set();
+      this.participatedThreads.set(jid, set);
+    }
+    set.add(threadTs);
+    if (set.size > SlackChannel.MAX_TRACKED_THREADS) {
+      const oldest = set.values().next().value;
+      if (oldest) set.delete(oldest);
     }
   }
 
@@ -226,7 +250,10 @@ export class SlackChannel implements Channel {
       if (!replies.ok) continue;
       for (const reply of replies.messages ?? []) {
         if (reply.ts === parent.ts) continue;
-        if (Number(reply.ts) > since) collected.push(reply);
+        if (Number(reply.ts) > since) {
+          reply.parent = parent;
+          collected.push(reply);
+        }
       }
     }
 
@@ -264,9 +291,20 @@ export class SlackChannel implements Channel {
     // getTriggerPattern's fallback in the router.
     const trigger = groups[chatJid].trigger?.trim() || DEFAULT_TRIGGER;
     const mentionAs = trigger.startsWith('@') ? trigger : `@${trigger}`;
-    const content = this.botUserId
+    let content = this.botUserId
       ? (msg.text || '').replaceAll(`<@${this.botUserId}>`, mentionAs)
       : msg.text || '';
+
+    // Replying inside a thread the assistant has posted in is addressing
+    // it — nobody re-@-mentions a person per reply in their own thread.
+    // Prefix the trigger so the router summons without one.
+    const inOwnThread = Boolean(
+      msg.thread_ts &&
+      this.participatedThreads.get(chatJid)?.has(msg.thread_ts),
+    );
+    if (inOwnThread && !buildTriggerPattern(trigger).test(content.trim())) {
+      content = `${mentionAs} ${content}`;
+    }
 
     this.replyThreads.set(chatJid, msg.thread_ts);
     this.opts.onMessage(chatJid, {
@@ -279,6 +317,17 @@ export class SlackChannel implements Channel {
       is_from_me: false,
       is_bot_message: Boolean(msg.bot_id),
       thread_id: msg.thread_ts,
+      ...(msg.parent?.text
+        ? {
+            reply_to_message_id: msg.parent.ts,
+            reply_to_message_content: msg.parent.text,
+            reply_to_sender_name:
+              (msg.parent.user && this.senderNames.get(msg.parent.user)) ||
+              msg.parent.username ||
+              msg.parent.user ||
+              'unknown',
+          }
+        : {}),
     });
 
     if (msg.user && !this.senderNames.has(msg.user)) {

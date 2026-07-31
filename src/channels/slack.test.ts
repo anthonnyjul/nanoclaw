@@ -391,6 +391,192 @@ describe('polling', () => {
     await channel.disconnect();
   });
 
+  it('treats a reply in a thread the bot posted in as addressed', async () => {
+    const { channel, received } = await connected(registered);
+    // 1) A triggered thread message arrives — sets the reply thread.
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.1000',
+              text: 'parent',
+              user: 'U1',
+              latest_reply: '9999999999.2000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.1000', text: 'parent', user: 'U1' },
+            {
+              ts: '9999999999.2000',
+              text: '@Aria look at this',
+              user: 'U1',
+              thread_ts: '9999999999.1000',
+            },
+          ],
+        },
+      ],
+      'chat.postMessage': [{ ok: true }],
+    });
+    await pollOnce(channel);
+    // 2) The bot replies into that thread — it now owns the thread.
+    await channel.sendMessage(JID, 'on it');
+    // 3) A bare follow-up in the same thread arrives.
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.1000',
+              text: 'parent',
+              user: 'U1',
+              latest_reply: '9999999999.3000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.1000', text: 'parent', user: 'U1' },
+            {
+              ts: '9999999999.3000',
+              text: 'and what about the cart?',
+              user: 'U1',
+              thread_ts: '9999999999.1000',
+            },
+          ],
+        },
+      ],
+    });
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(2);
+    expect(received[1].content).toBe('@Aria and what about the cart?');
+    await channel.disconnect();
+  });
+
+  it('does not double-prefix a follow-up that already carries the trigger', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.1000',
+              text: 'parent',
+              user: 'U1',
+              latest_reply: '9999999999.2000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.1000', text: 'parent', user: 'U1' },
+            {
+              ts: '9999999999.2000',
+              text: 'hi',
+              user: 'U1',
+              thread_ts: '9999999999.1000',
+            },
+          ],
+        },
+      ],
+      'chat.postMessage': [{ ok: true }],
+    });
+    await pollOnce(channel);
+    await channel.sendMessage(JID, 'hello');
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.1000',
+              text: 'parent',
+              user: 'U1',
+              latest_reply: '9999999999.3000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.1000', text: 'parent', user: 'U1' },
+            {
+              ts: '9999999999.3000',
+              text: 'aria ship it',
+              user: 'U1',
+              thread_ts: '9999999999.1000',
+            },
+          ],
+        },
+      ],
+    });
+    await pollOnce(channel);
+
+    expect(received[1].content).toBe('aria ship it');
+    await channel.disconnect();
+  });
+
+  it('attaches the thread parent as quoted context on replies', async () => {
+    const { channel, received } = await connected(registered);
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.1000',
+              text: 'the cart bug report',
+              user: 'U1',
+              latest_reply: '9999999999.2000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            { ts: '9999999999.1000', text: 'the cart bug report', user: 'U1' },
+            {
+              ts: '9999999999.2000',
+              text: '@Aria thoughts?',
+              user: 'U1',
+              thread_ts: '9999999999.1000',
+            },
+          ],
+        },
+      ],
+    });
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].reply_to_message_id).toBe('9999999999.1000');
+    expect(received[0].reply_to_message_content).toBe('the cart bug report');
+    await channel.disconnect();
+  });
+
   it('advances the cursor so a message is delivered once', async () => {
     const { channel, received } = await connected(registered);
     mockSlack({
