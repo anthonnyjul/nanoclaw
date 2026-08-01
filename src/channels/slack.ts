@@ -9,7 +9,7 @@
  * The token is read from .env only — never from process.env — so it is not
  * inherited by the agent containers this process spawns.
  */
-import { DEFAULT_TRIGGER } from '../config.js';
+import { buildTriggerPattern, DEFAULT_TRIGGER } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -48,9 +48,17 @@ interface SlackMessage {
   latest_reply?: string;
 }
 
+/** A polled message paired with its thread parent, when it is a reply. */
+interface InboundSlackMessage {
+  msg: SlackMessage;
+  parent?: SlackMessage;
+}
+
 interface SlackApiResponse {
   ok: boolean;
   error?: string;
+  /** `ts` of the message just posted (chat.postMessage). */
+  ts?: string;
   messages?: SlackMessage[];
   channel?: { name?: string };
   user_id?: string;
@@ -77,6 +85,14 @@ export class SlackChannel implements Channel {
   private cursors = new Map<string, string>();
   /** Thread to reply into, keyed by JID — set from the last inbound message. */
   private replyThreads = new Map<string, string | undefined>();
+  /**
+   * Threads the assistant has posted in, per JID. A reply into one of these
+   * is addressed at the assistant even without the trigger word — replying
+   * in someone's thread is how humans address them on Slack. In-memory only:
+   * after a restart the first reply in an old thread needs the trigger once.
+   */
+  private participatedThreads = new Map<string, Set<string>>();
+  private static readonly MAX_TRACKED_THREADS = 500;
   /** Display names by Slack user ID. Caches misses too, so we ask once. */
   private senderNames = new Map<string, string>();
   private botUserId = '';
@@ -136,6 +152,26 @@ export class SlackChannel implements Channel {
     if (!res.ok) {
       throw new Error(`Slack chat.postMessage failed: ${res.error}`);
     }
+    // A reply joins an existing thread; a top-level post roots a potential
+    // new one — replies to it arrive carrying its ts as their thread_ts.
+    const threadRoot = thread ?? res.ts;
+    if (threadRoot) this.rememberThread(jid, threadRoot);
+  }
+
+  private rememberThread(jid: string, threadTs: string): void {
+    let set = this.participatedThreads.get(jid);
+    if (!set) {
+      set = new Set();
+      this.participatedThreads.set(jid, set);
+    }
+    // Delete-then-add refreshes insertion order (Set.add on an existing
+    // member does not), so the cap below evicts least-recently-active.
+    set.delete(threadTs);
+    set.add(threadTs);
+    if (set.size > SlackChannel.MAX_TRACKED_THREADS) {
+      const oldest = set.values().next().value;
+      if (oldest) set.delete(oldest);
+    }
   }
 
   async syncGroups(force: boolean): Promise<void> {
@@ -168,7 +204,7 @@ export class SlackChannel implements Channel {
     try {
       for (const id of this.opts.channelIds) {
         const messages = await this.fetchNew(id);
-        for (const msg of messages) this.deliver(id, msg);
+        for (const { msg, parent } of messages) this.deliver(id, msg, parent);
       }
     } catch (err) {
       logger.warn({ err }, 'Slack poll failed, will retry next tick');
@@ -185,9 +221,9 @@ export class SlackChannel implements Channel {
    * top-level fetch with a lookback instead of splitting it fills page 1 with
    * old messages on a busy channel, hiding the new ones on pages never read.
    */
-  private async fetchNew(channelId: string): Promise<SlackMessage[]> {
+  private async fetchNew(channelId: string): Promise<InboundSlackMessage[]> {
     const since = Number(this.cursors.get(channelId) ?? 0);
-    const collected: SlackMessage[] = [];
+    const collected: InboundSlackMessage[] = [];
 
     const top = await this.api('conversations.history', {
       channel: channelId,
@@ -203,7 +239,7 @@ export class SlackChannel implements Channel {
       return [];
     }
     for (const m of top.messages ?? []) {
-      if (Number(m.ts) > since) collected.push(m);
+      if (Number(m.ts) > since) collected.push({ msg: m });
     }
 
     const lookback = Math.max(since - THREAD_LOOKBACK_SECONDS, 0);
@@ -226,17 +262,21 @@ export class SlackChannel implements Channel {
       if (!replies.ok) continue;
       for (const reply of replies.messages ?? []) {
         if (reply.ts === parent.ts) continue;
-        if (Number(reply.ts) > since) collected.push(reply);
+        if (Number(reply.ts) > since) collected.push({ msg: reply, parent });
       }
     }
 
-    collected.sort((a, b) => Number(a.ts) - Number(b.ts));
+    collected.sort((a, b) => Number(a.msg.ts) - Number(b.msg.ts));
     const newest = collected[collected.length - 1];
-    if (newest) this.cursors.set(channelId, newest.ts);
+    if (newest) this.cursors.set(channelId, newest.msg.ts);
     return collected;
   }
 
-  private deliver(channelId: string, msg: SlackMessage): void {
+  private deliver(
+    channelId: string,
+    msg: SlackMessage,
+    parent?: SlackMessage,
+  ): void {
     // Joins, topic changes and other channel events carry a subtype and are
     // not conversation. Thread broadcasts are.
     if (msg.subtype && msg.subtype !== 'thread_broadcast') return;
@@ -264,26 +304,57 @@ export class SlackChannel implements Channel {
     // getTriggerPattern's fallback in the router.
     const trigger = groups[chatJid].trigger?.trim() || DEFAULT_TRIGGER;
     const mentionAs = trigger.startsWith('@') ? trigger : `@${trigger}`;
-    const content = this.botUserId
+    let content = this.botUserId
       ? (msg.text || '').replaceAll(`<@${this.botUserId}>`, mentionAs)
       : msg.text || '';
+
+    // Replying inside a thread the assistant has posted in is addressing
+    // it — nobody re-@-mentions a person per reply in their own thread.
+    // Prefix the trigger so the router summons without one.
+    const inOwnThread = Boolean(
+      msg.thread_ts &&
+      this.participatedThreads.get(chatJid)?.has(msg.thread_ts),
+    );
+    if (inOwnThread && !buildTriggerPattern(trigger).test(content.trim())) {
+      content = `${mentionAs} ${content}`;
+    }
 
     this.replyThreads.set(chatJid, msg.thread_ts);
     this.opts.onMessage(chatJid, {
       id: msg.ts,
       chat_jid: chatJid,
       sender,
-      sender_name: this.senderNames.get(sender) || msg.username || sender,
+      sender_name: this.displayName(sender, msg.username),
       content,
       timestamp,
       is_from_me: false,
       is_bot_message: Boolean(msg.bot_id),
       thread_id: msg.thread_ts,
+      ...(parent?.text
+        ? {
+            reply_to_message_id: parent.ts,
+            reply_to_message_content: parent.text,
+            reply_to_sender_name: this.displayName(
+              parent.user,
+              parent.username,
+            ),
+          }
+        : {}),
     });
 
     if (msg.user && !this.senderNames.has(msg.user)) {
       void this.cacheSenderName(msg.user);
     }
+  }
+
+  /** One fallback chain for sender display names, shared by all render sites. */
+  private displayName(userId?: string, username?: string): string {
+    return (
+      (userId && this.senderNames.get(userId)) ||
+      username ||
+      userId ||
+      'unknown'
+    );
   }
 
   /**
