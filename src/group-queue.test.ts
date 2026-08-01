@@ -513,4 +513,26 @@ describe('isConversationActive', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(queue.isConversationActive('g@slack')).toBe(false);
   });
+
+  it('is false for a task container even when registered', async () => {
+    const queue = new GroupQueue();
+    let release: () => void = () => {};
+    const running = new Promise<void>((r) => {
+      release = r;
+    });
+    queue.enqueueTask('g@slack', 'task-1', async () => {
+      await running;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    queue.registerProcess(
+      'g@slack',
+      { kill: () => true } as never,
+      'container-1',
+      'folder',
+    );
+    // Active with a folder, but a task container — not a conversation.
+    expect(queue.isConversationActive('g@slack')).toBe(false);
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+  });
 });

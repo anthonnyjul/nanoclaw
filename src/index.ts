@@ -5,7 +5,6 @@ import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
   DEFAULT_TRIGGER,
-  getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
@@ -57,10 +56,10 @@ import {
 } from './remote-control.js';
 import {
   isSenderAllowed,
-  isTriggerAllowed,
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { hasSummons } from './summons.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -215,16 +214,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
+  // For non-main groups, check if trigger is required and present.
+  // Deliberately no conversationActive here: this is the fresh-spawn path,
+  // there is no live container to continue a conversation with.
   if (!isMainGroup && group.requiresTrigger !== false) {
-    const triggerPattern = getTriggerPattern(group.trigger);
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) return true;
+    const summoned = hasSummons(chatJid, missedMessages, {
+      trigger: group.trigger,
+      allowlist: loadSenderAllowlist(),
+    });
+    if (!summoned) return true;
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -461,28 +459,21 @@ async function startMessageLoop(): Promise<void> {
           }
 
           const isMainGroup = group.isMain === true;
-          // A live conversation container means the group was already
-          // summoned — follow-ups flow without re-triggering, like a
-          // human conversation. The window closes when the container
-          // goes idle and shuts down.
-          const needsTrigger =
-            !isMainGroup &&
-            group.requiresTrigger !== false &&
-            !queue.isConversationActive(chatJid);
 
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
+          // For non-main groups, only act on summons messages. A live
+          // conversation container means the group was already summoned —
+          // follow-ups flow without re-triggering, like a human
+          // conversation (the window closes when the container goes idle
+          // and shuts down) — but the sender allowlist still applies.
+          // Non-summons messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const triggerPattern = getTriggerPattern(group.trigger);
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                triggerPattern.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
+          if (!isMainGroup && group.requiresTrigger !== false) {
+            const summoned = hasSummons(chatJid, groupMessages, {
+              trigger: group.trigger,
+              conversationActive: queue.isConversationActive(chatJid),
+              allowlist: loadSenderAllowlist(),
+            });
+            if (!summoned) continue;
           }
 
           // Pull all messages since lastAgentTimestamp so non-trigger

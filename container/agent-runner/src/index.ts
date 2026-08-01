@@ -409,12 +409,14 @@ async function runQuery(
   // Thread-window: when resuming an existing session and the caller has no
   // anchor yet, look up the N-th-last assistant UUID from the session JSONL
   // and pass it as resumeSessionAt. Caps the SDK's log replay to the last N
-  // turns; prevents session-bloat "Prompt is too long" failures.
-  if (sessionId && !resumeAt && THREAD_WINDOW > 0) {
+  // turns; prevents session-bloat "Prompt is too long" failures. Kept in a
+  // local so caller-supplied and derived anchors stay distinguishable.
+  let effectiveResumeAt = resumeAt;
+  if (sessionId && !effectiveResumeAt && THREAD_WINDOW > 0) {
     const anchor = findResumeAnchor(sessionJsonlPath(sessionId), THREAD_WINDOW);
     if (anchor) {
       log(`Thread-window anchor: uuid=${anchor} (windowSize=${THREAD_WINDOW})`);
-      resumeAt = anchor;
+      effectiveResumeAt = anchor;
     } else {
       log(
         `Thread-window: no anchor (log shorter than windowSize=${THREAD_WINDOW} or missing) — SDK picks 'latest'`,
@@ -481,7 +483,7 @@ async function runQuery(
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
-      resumeSessionAt: resumeAt,
+      resumeSessionAt: effectiveResumeAt,
       systemPrompt: globalClaudeMd
         ? {
             type: 'preset' as const,

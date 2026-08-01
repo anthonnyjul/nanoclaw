@@ -154,15 +154,24 @@ export class GroupQueue {
   }
 
   /**
+   * The single definition of "a conversation container is live": the exact
+   * condition under which sendMessage() can pipe a follow-up. Type predicate
+   * so callers get groupFolder narrowed to string.
+   */
+  private isLiveConversation(
+    state: GroupState,
+  ): state is GroupState & { groupFolder: string } {
+    return Boolean(state.active && state.groupFolder && !state.isTaskContainer);
+  }
+
+  /**
    * A conversation container is live for this group — the same condition
    * under which sendMessage() can pipe a follow-up. While true, the group
    * is mid-conversation and new messages should not need a fresh trigger.
    */
   isConversationActive(groupJid: string): boolean {
     const state = this.groups.get(groupJid);
-    return Boolean(
-      state?.active && state.groupFolder && !state.isTaskContainer,
-    );
+    return state ? this.isLiveConversation(state) : false;
   }
 
   /**
@@ -171,8 +180,7 @@ export class GroupQueue {
    */
   sendMessage(groupJid: string, text: string): boolean {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
-      return false;
+    if (!this.isLiveConversation(state)) return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');

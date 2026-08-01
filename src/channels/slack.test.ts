@@ -27,6 +27,7 @@ const BOT_ID = 'B0AQBEA8VJ4';
 
 interface SlackReply {
   ok: boolean;
+  ts?: string;
   bot_id?: string;
   messages?: Record<string, unknown>[];
   user_id?: string;
@@ -466,6 +467,58 @@ describe('polling', () => {
     await channel.disconnect();
   });
 
+  it("treats a reply to the bot's own top-level post as addressed", async () => {
+    const { channel, received } = await connected(registered);
+    // 1) The bot posts top-level (no reply thread pending) — its message ts
+    //    becomes a potential thread root.
+    mockSlack({
+      'chat.postMessage': [{ ok: true, ts: '9999999999.5000' }],
+    });
+    await channel.sendMessage(JID, 'daily status: all green');
+    // 2) A human replies in the thread rooted at the bot's own post.
+    mockSlack({
+      'conversations.history': [
+        { ok: true, messages: [] },
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.5000',
+              text: 'daily status: all green',
+              user: BOT,
+              bot_id: BOT_ID,
+              latest_reply: '9999999999.6000',
+            },
+          ],
+        },
+      ],
+      'conversations.replies': [
+        {
+          ok: true,
+          messages: [
+            {
+              ts: '9999999999.5000',
+              text: 'daily status: all green',
+              user: BOT,
+              bot_id: BOT_ID,
+            },
+            {
+              ts: '9999999999.6000',
+              text: 'what about the cart?',
+              user: 'U1',
+              thread_ts: '9999999999.5000',
+            },
+          ],
+        },
+      ],
+    });
+    await pollOnce(channel);
+
+    expect(received).toHaveLength(1);
+    expect(received[0].content).toBe('@Aria what about the cart?');
+    await channel.disconnect();
+  });
+
   it('does not double-prefix a follow-up that already carries the trigger', async () => {
     const { channel, received } = await connected(registered);
     mockSlack({
@@ -535,6 +588,24 @@ describe('polling', () => {
 
     expect(received[1].content).toBe('aria ship it');
     await channel.disconnect();
+  });
+
+  it('evicts the least-recently-active thread at the tracking cap', () => {
+    const { channel } = makeChannel();
+    const c = channel as unknown as {
+      rememberThread: (jid: string, ts: string) => void;
+      participatedThreads: Map<string, Set<string>>;
+    };
+    const cap = (SlackChannel as unknown as { MAX_TRACKED_THREADS: number })
+      .MAX_TRACKED_THREADS;
+    for (let i = 1; i <= cap; i++) c.rememberThread(JID, `t${i}`);
+    c.rememberThread(JID, 't1'); // still-hot thread, refreshed
+    c.rememberThread(JID, `t${cap + 1}`); // overflow
+    const set = c.participatedThreads.get(JID)!;
+    expect(set.size).toBe(cap);
+    expect(set.has('t1')).toBe(true); // refreshed → survives
+    expect(set.has('t2')).toBe(false); // least-recently-active → evicted
+    expect(set.has(`t${cap + 1}`)).toBe(true);
   });
 
   it('attaches the thread parent as quoted context on replies', async () => {

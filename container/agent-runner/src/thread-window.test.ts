@@ -140,8 +140,11 @@ describe('findResumeAnchor', () => {
     expect(findResumeAnchor(p, 2)).toBe('a2');
   });
 
-  it('exports the default window size and env var name as named constants', () => {
-    expect(DEFAULT_THREAD_WINDOW).toBe(15);
+  it('keeps a sane default window and the env-var-name contract', () => {
+    // The env var name is a deployment contract; the default only needs to
+    // be a usable positive window (its exact value is tunable).
     expect(THREAD_WINDOW_ENV_VAR).toBe('THREAD_WINDOW');
+    expect(DEFAULT_THREAD_WINDOW).toBeGreaterThan(0);
+    expect(Number.isInteger(DEFAULT_THREAD_WINDOW)).toBe(true);
   });
 });

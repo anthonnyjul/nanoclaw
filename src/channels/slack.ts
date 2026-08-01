@@ -46,13 +46,19 @@ interface SlackMessage {
   subtype?: string;
   thread_ts?: string;
   latest_reply?: string;
-  /** Set locally on thread replies: the parent message they answer. */
+}
+
+/** A polled message paired with its thread parent, when it is a reply. */
+interface InboundSlackMessage {
+  msg: SlackMessage;
   parent?: SlackMessage;
 }
 
 interface SlackApiResponse {
   ok: boolean;
   error?: string;
+  /** `ts` of the message just posted (chat.postMessage). */
+  ts?: string;
   messages?: SlackMessage[];
   channel?: { name?: string };
   user_id?: string;
@@ -146,7 +152,10 @@ export class SlackChannel implements Channel {
     if (!res.ok) {
       throw new Error(`Slack chat.postMessage failed: ${res.error}`);
     }
-    if (thread) this.rememberThread(jid, thread);
+    // A reply joins an existing thread; a top-level post roots a potential
+    // new one — replies to it arrive carrying its ts as their thread_ts.
+    const threadRoot = thread ?? res.ts;
+    if (threadRoot) this.rememberThread(jid, threadRoot);
   }
 
   private rememberThread(jid: string, threadTs: string): void {
@@ -155,6 +164,9 @@ export class SlackChannel implements Channel {
       set = new Set();
       this.participatedThreads.set(jid, set);
     }
+    // Delete-then-add refreshes insertion order (Set.add on an existing
+    // member does not), so the cap below evicts least-recently-active.
+    set.delete(threadTs);
     set.add(threadTs);
     if (set.size > SlackChannel.MAX_TRACKED_THREADS) {
       const oldest = set.values().next().value;
@@ -192,7 +204,7 @@ export class SlackChannel implements Channel {
     try {
       for (const id of this.opts.channelIds) {
         const messages = await this.fetchNew(id);
-        for (const msg of messages) this.deliver(id, msg);
+        for (const { msg, parent } of messages) this.deliver(id, msg, parent);
       }
     } catch (err) {
       logger.warn({ err }, 'Slack poll failed, will retry next tick');
@@ -209,9 +221,9 @@ export class SlackChannel implements Channel {
    * top-level fetch with a lookback instead of splitting it fills page 1 with
    * old messages on a busy channel, hiding the new ones on pages never read.
    */
-  private async fetchNew(channelId: string): Promise<SlackMessage[]> {
+  private async fetchNew(channelId: string): Promise<InboundSlackMessage[]> {
     const since = Number(this.cursors.get(channelId) ?? 0);
-    const collected: SlackMessage[] = [];
+    const collected: InboundSlackMessage[] = [];
 
     const top = await this.api('conversations.history', {
       channel: channelId,
@@ -227,7 +239,7 @@ export class SlackChannel implements Channel {
       return [];
     }
     for (const m of top.messages ?? []) {
-      if (Number(m.ts) > since) collected.push(m);
+      if (Number(m.ts) > since) collected.push({ msg: m });
     }
 
     const lookback = Math.max(since - THREAD_LOOKBACK_SECONDS, 0);
@@ -250,20 +262,21 @@ export class SlackChannel implements Channel {
       if (!replies.ok) continue;
       for (const reply of replies.messages ?? []) {
         if (reply.ts === parent.ts) continue;
-        if (Number(reply.ts) > since) {
-          reply.parent = parent;
-          collected.push(reply);
-        }
+        if (Number(reply.ts) > since) collected.push({ msg: reply, parent });
       }
     }
 
-    collected.sort((a, b) => Number(a.ts) - Number(b.ts));
+    collected.sort((a, b) => Number(a.msg.ts) - Number(b.msg.ts));
     const newest = collected[collected.length - 1];
-    if (newest) this.cursors.set(channelId, newest.ts);
+    if (newest) this.cursors.set(channelId, newest.msg.ts);
     return collected;
   }
 
-  private deliver(channelId: string, msg: SlackMessage): void {
+  private deliver(
+    channelId: string,
+    msg: SlackMessage,
+    parent?: SlackMessage,
+  ): void {
     // Joins, topic changes and other channel events carry a subtype and are
     // not conversation. Thread broadcasts are.
     if (msg.subtype && msg.subtype !== 'thread_broadcast') return;
@@ -311,21 +324,20 @@ export class SlackChannel implements Channel {
       id: msg.ts,
       chat_jid: chatJid,
       sender,
-      sender_name: this.senderNames.get(sender) || msg.username || sender,
+      sender_name: this.displayName(sender, msg.username),
       content,
       timestamp,
       is_from_me: false,
       is_bot_message: Boolean(msg.bot_id),
       thread_id: msg.thread_ts,
-      ...(msg.parent?.text
+      ...(parent?.text
         ? {
-            reply_to_message_id: msg.parent.ts,
-            reply_to_message_content: msg.parent.text,
-            reply_to_sender_name:
-              (msg.parent.user && this.senderNames.get(msg.parent.user)) ||
-              msg.parent.username ||
-              msg.parent.user ||
-              'unknown',
+            reply_to_message_id: parent.ts,
+            reply_to_message_content: parent.text,
+            reply_to_sender_name: this.displayName(
+              parent.user,
+              parent.username,
+            ),
           }
         : {}),
     });
@@ -333,6 +345,16 @@ export class SlackChannel implements Channel {
     if (msg.user && !this.senderNames.has(msg.user)) {
       void this.cacheSenderName(msg.user);
     }
+  }
+
+  /** One fallback chain for sender display names, shared by all render sites. */
+  private displayName(userId?: string, username?: string): string {
+    return (
+      (userId && this.senderNames.get(userId)) ||
+      username ||
+      userId ||
+      'unknown'
+    );
   }
 
   /**
